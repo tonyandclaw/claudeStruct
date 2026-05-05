@@ -241,10 +241,14 @@ Goal: 5-50 devs share the tool with shared visibility, shared budgets, and team-
   - `auth.py:current_principal` chain: bearer wins, then session-cookie fallback. New `authenticate_session_cookie(session, cookie)` mirrors `authenticate(session, key)`
   - 14 new tests: login redirect + 503 unconfigured, callback state-mismatch / unregistered-email-403 / token-exchange-failure / happy-path / `/user/emails` fallback, session cookie authenticates downstream `/v1/dashboard`, `/v1/auth/me` shape + 401 path, logout revokes + idempotent without cookie, bearer-wins ordering, revoked cookie falls through to 401
   - Pending: Google OAuth (structurally identical, separate provider config). Tracked under W8.7 (self-serve signup) so it lands alongside the domain-allowlist feature it depends on
-- [~] **W6.5 — Shared dashboard** (multi-user view shipped; alerts deferred)
+- [~] **W6.5 — Shared dashboard** (multi-user view shipped; alerts detection shipped; notification delivery deferred)
   - `GET /v1/dashboard/team` endpoint reads the `runs` table for the caller's org (filtered to terminal states `done`/`failed` so queued/running rows don't skew rollups). Returns `total_runs` + `total_cost_usd` headline numbers, `by_author` leaderboard sorted by spend desc with email + run-count + tokens, `by_task` task-type breakdown, plus `recent` (default 50, max 500) for the activity feed
   - New schemas in `src/claudestruct/server/schema.py`: `AuthorRollup`, `TaskRollup`, `TeamDashboardResponse`. Tenant-scoped via `Run.org_id == principal.org_id` so an org can never see another org's spend
-  - Pending: regression alerts ("run cost > 2σ over team baseline" → Slack/email) and budget-cap rollups per team — both depend on a notification surface that doesn't exist yet
+  - **Cost-regression alerts (this PR)**: `src/claudestruct/server/alerts.py` ships `compute_team_alerts(session, *, org_id, lookback_days=30, recent_window_hours=72, sigma_threshold=2.0)` — folds per-task baseline mean/stddev over the lookback window and flags `done` runs in the recent window whose `cost_usd` is more than `sigma_threshold` σ above their task's baseline. Per-task scoping prevents `cs plan` from firing alerts just because `cs review` is cheap; sample-size floor of 5 suppresses spurious alerts on tasks with too little history. Failed runs and negative costs are excluded from the baseline (they would distort the mean).
+  - `GET /v1/alerts` (member+, org-scoped, mirrors `/v1/dashboard/team`'s tenant model) with `lookback_days` / `recent_window_hours` / `sigma_threshold` query knobs. Returns `baselines[]` + `alerts[]`; baselines surface `stddev=null` when below the sample-size floor so the SPA can render "insufficient data" rather than a noisy estimate. Alerts sorted by z_score desc, capped at 200.
+  - New schemas: `TaskBaselineResponse`, `RunAlertResponse`, `TeamAlertsResponse`. Router mounted in `app.py` after the existing SLO router.
+  - Tests: `tests/test_alerts.py` (23 cases) — `_mean_stddev` math (empty / single / sample-stddev with hand-computed value), `compute_team_alerts` covering empty / below-min-sample / steady-cost / clear-outlier / per-task-isolation / outside-recent-window / failed-run-excluded / negative-cost-excluded / cross-tenant-isolation / outside-lookback / sort order / custom threshold honored; HTTP endpoint covering 401 unauth / 403 viewer / 200 member / response shape / param validation (lookback=0 → 422, sigma=0 → 422) / X-CS-Region header / end-to-end seeded outlier
+  - Pending: notification delivery (Slack webhook / email) — detection now provides a stable surface for the deliverer to poll; budget-cap rollups per team (separate alert kind on the same endpoint)
 - [~] **W6.6 — GitHub App** (webhook receiver + outbound ack comment + verdict-on-completion + Checks API shipped; bot-as-actor PR opens deferred)
   - `GitHubInstallation` SQLAlchemy model maps `installation_id` ↔ `org_id` with per-install `webhook_secret` + optional `repo_filter` substring + `bot_user_id` sentinel for attribution
   - `POST /v1/github/webhook` — auth-bypassing endpoint (signature is the only gate); reads raw body for HMAC stability before JSON-parsing; verifies `X-Hub-Signature-256` via `hmac.compare_digest`; same 401 status on unknown installation AND bad signature so attackers can't enumerate IDs
@@ -386,6 +390,11 @@ Reopen criterion: a signed enterprise contract or three serious leads asking for
 
 ## Last Update
 
+- 2026-05-05 — W6.5 advance: cost-regression alerts detection shipped:
+  - `src/claudestruct/server/alerts.py` — per-task baseline (mean / sample-stddev) over the org's lookback window; flags `done` runs in the recent eval window whose cost exceeds `mean + sigma_threshold * stddev`. Failed runs and negative costs excluded from the baseline; sample-size floor of 5 suppresses noisy estimates
+  - `GET /v1/alerts` (member+, org-scoped) with `lookback_days` / `recent_window_hours` / `sigma_threshold` query knobs
+  - 23 new tests covering math, baseline / alert flagging, per-task scoping, tenant isolation, recent-window filter, RBAC + HTTP shape. Total Python: 379 passed, 3 skipped; ruff clean
+  - Pending under W6.5: Slack/email notification delivery (the endpoint is what those deliverers will poll), per-team budget-cap rollups
 - 2026-04-28 — W6.6 close-out: GitHub Checks API integration shipped:
   - `Run` gains nullable `github_head_sha` + `github_check_run_id` columns; webhook persists `pull_request.head.sha` (None for issue_comment triggers — comment-based verdict still fires)
   - `github_app.py` adds `format_check_run_payload` (with status/conclusion validation), `post_check_run`, `patch_check_run`, `format_completed_check_payload`, plus the `_with_token` glue mirroring `post_ack_comment`

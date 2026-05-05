@@ -248,6 +248,52 @@ class UsageResponse(BaseModel):
     cost_usd: float
 
 
+# --- Cost-regression alerts (W6.5) ---------------------------------
+
+class TaskBaselineResponse(BaseModel):
+    """Per-task cost baseline for the org's lookback window. ``stddev``
+    is ``None`` when the task has fewer than ``min_sample_size`` runs —
+    the UI should render "insufficient data" rather than a noisy
+    estimate."""
+    task: str
+    sample_size: int
+    mean_cost_usd: float
+    stddev_cost_usd: Optional[float]
+    max_cost_usd: float
+
+
+class RunAlertResponse(BaseModel):
+    """A single anomalously-expensive run flagged against its task's
+    baseline. ``z_score`` is comparable across tasks because each run
+    is scored against its own task's distribution."""
+    run_id: str
+    task: str
+    user_id: int
+    user_email: Optional[str]
+    cost_usd: float
+    baseline_mean_usd: float
+    baseline_stddev_usd: float
+    z_score: float
+    threshold_sigma: float
+    created_at: datetime
+
+
+class TeamAlertsResponse(BaseModel):
+    """Org-scoped cost-anomaly alerts (W6.5).
+
+    The snapshot is keyed off the caller's org so the leaderboard and
+    alerts agree on what "this team" means. A separate notification
+    delivery surface (Slack / email) consumes the same alert objects;
+    that surface is still pending in the W6.5 roadmap entry."""
+    generated_at: datetime
+    lookback_days: int
+    recent_window_hours: int
+    sigma_threshold: float
+    min_sample_size: int
+    baselines: list[TaskBaselineResponse]
+    alerts: list[RunAlertResponse]
+
+
 # --- SLO snapshot (W8.7) -------------------------------------------
 
 class SloWindow(BaseModel):

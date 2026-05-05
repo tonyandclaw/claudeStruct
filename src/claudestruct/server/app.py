@@ -18,6 +18,9 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from claudestruct import __version__
 from claudestruct.server.db import init_db, make_engine, make_session_factory
 from claudestruct.server.routers import (
+    alerts as alerts_router,
+)
+from claudestruct.server.routers import (
     audit as audit_router,
 )
 from claudestruct.server.routers import (
@@ -136,5 +139,6 @@ def create_app(
     app.include_router(github_router.router)
     app.include_router(oauth_router.router)
     app.include_router(slo_router.router)
+    app.include_router(alerts_router.router)
 
     return app
