@@ -26,3 +26,5 @@ claw-squad/dist/
 .claw-squad/memory/
 site/
 .coverage
+.claude/settings.json
+.claude/worktrees/
