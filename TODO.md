@@ -233,16 +233,16 @@ Goal: 5-50 devs share the tool with shared visibility, shared budgets, and team-
   - FastAPI app under `src/claudestruct/server/` behind the `[server]` extra: `/healthz`, `/readyz`, `/v1/dashboard`, `/v1/budget`, `/v1/runs` (POST + GET), `/v1/keys` (list/create/revoke). OpenAPI 3.1 at `/openapi.json`, interactive viewer at `/docs`.
   - Auth: bearer API keys (`ck_<key_id>_<secret>`, SHA-256-hashed secret, last_used stamp on auth success).
   - `POST /v1/runs` returns 202 with a placeholder run_id — actual worker model landed in **W6.1**.
-  - **Session cookie hardening (this PR)**: explicit `HttpOnly` + `Secure` + `SameSite=Lax` attributes verified in tests; expired session rejection; unknown cookie → 401.
+  - **Session cookie hardening**: explicit `HttpOnly` + `Secure` + `SameSite=Lax` attributes verified in tests; expired session rejection; unknown cookie → 401.
   - Tests: `tests/test_server.py` (18 cases) + `tests/test_session_cookies.py` (7 new cases). Total: 25 passed; ruff clean.
   - Pending: per-language SDK stubs (deferred until the API surface is closer to final)
-- [x] **W6.3 — User / team / org model + RBAC** (Alembic scaffolding shipped)
-  - SQLAlchemy 2.x models: `orgs`, `users`, `memberships`, `api_keys`. Idempotent `init_db()` via `Base.metadata.create_all` for the draft.
+- [x] **W6.3 — User / team / org model + RBAC** (Alembic + teams both shipped)
+  - SQLAlchemy 2.x models: `orgs`, `users`, `memberships`, `api_keys`, `teams`, `team_memberships`. Idempotent `init_db()` via `Base.metadata.create_all` for bootstrap; Alembic for ongoing migrations.
   - Roles: `admin` / `member` / `viewer` enforced by `require_role(min_role)` FastAPI dependency
-  - `cs serve init-db / add-org / add-user / add-key` covers the bootstrap path
-  - **Alembic setup (this PR)**: `alembic.ini` + `alembic/env.py` (reads `DATABASE_URL`, imports all models) + `cs serve migrate [--revision head|base]` command. Ready for future schema migrations; first real migration lands when the schema changes.
-  - 6 new tests in `tests/test_alembic.py`; ruff clean.
-  - Pending: teams (currently flat membership of users → orgs), seeded migration fixtures
+  - `cs serve init-db / add-org / add-user / add-key / add-team / add-team-member / migrate` covers the bootstrap + migration path
+  - **Alembic setup**: `alembic.ini` + `alembic/env.py` (reads `DATABASE_URL`, imports all models) + `cs serve migrate [--revision head|base]` command. Ready for future schema migrations; first real migration lands when the schema changes. 6 tests in `tests/test_alembic.py`.
+  - **Teams (this PR)**: `Team` + `TeamMembership` SQLAlchemy models with `(org_id, slug)` and `(team_id, user_id)` UNIQUE constraints. Schema chose separate `team_memberships` table over a `team_id` column on `Membership` so a polyglot engineer can be on `platform-eng` AND `growth` without duplicating their org membership row. `Org.teams` ORM-level cascade ensures dropping an org sweeps up teams + memberships in one step (SQLite can't enforce `ondelete=CASCADE` without the FK pragma; ORM cascade gets us deterministic behaviour either way). New CLI subcommands `cs serve add-team <slug> <name> <org>` and `cs serve add-team-member <email> <team> <org>`; both idempotent on re-run; the latter rejects users not already in the org (belt-and-braces against typo-driven cross-org grants). 14 tests in `tests/test_teams.py`: schema constraints + cascade chain (Org → Team → TeamMembership) + CLI happy/idempotent/error paths.
+  - Pending: seeded migration fixtures, dashboard `--team` filter (data model is ready)
 - [x] **W6.4 — OAuth login** (GitHub + Google both shipped)
   - `UserSession` SQLAlchemy model: per-row `session_token` (URL-safe random), `provider`, `expires_at` (14d hard cap), `revoked_at` for logout
   - `src/claudestruct/server/oauth.py` — GitHub helpers (`load_github_config`, `build_github_authorize_url`, `exchange_code_for_github_token`, `fetch_github_user`) + Google helpers (`GoogleOAuthConfig`, `load_google_config`, `build_google_authorize_url`, `exchange_code_for_google_token`, `fetch_google_user`). Injectable `http_client` so tests don't hit the providers.

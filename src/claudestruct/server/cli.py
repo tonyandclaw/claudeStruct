@@ -132,6 +132,136 @@ def serve_add_user(email: str, org_slug: str, name: str | None, role: str,
         click.echo(f"user id={user.id} email={user.email} role={role} org={org.slug}")
 
 
+@serve_group.command(
+    "add-team",
+    help="Create a team within an org (W6.3 follow-up).",
+)
+@click.argument("slug")
+@click.argument("name")
+@click.argument("org_slug")
+@click.option("--db-url", default=None, envvar="CLAUDESTRUCT_DATABASE_URL")
+def serve_add_team(
+    slug: str, name: str, org_slug: str, db_url: str | None,
+) -> None:
+    """Idempotent on the (org_slug, slug) pair: re-running with the
+    same args prints the existing team's id rather than 422-ing on
+    the unique constraint. Lets ops scripts run unconditionally."""
+    _ensure_server_deps()
+    from sqlalchemy import select
+
+    from claudestruct.server.db import init_db, make_engine, make_session_factory
+    from claudestruct.server.models import Org, Team
+
+    engine = make_engine(db_url)
+    init_db(engine)
+    factory = make_session_factory(engine)
+    with factory() as session:
+        org = session.execute(
+            select(Org).where(Org.slug == org_slug)
+        ).scalar_one_or_none()
+        if org is None:
+            raise click.ClickException(
+                f"org '{org_slug}' not found; run `cs serve add-org` first."
+            )
+        existing = session.execute(
+            select(Team).where(Team.org_id == org.id, Team.slug == slug)
+        ).scalar_one_or_none()
+        if existing is not None:
+            click.echo(
+                f"team already exists id={existing.id} slug={existing.slug} "
+                f"org={org_slug}"
+            )
+            return
+        team = Team(org_id=org.id, slug=slug, name=name)
+        session.add(team)
+        session.commit()
+        session.refresh(team)
+        click.echo(
+            f"created team id={team.id} slug={team.slug} org={org_slug}"
+        )
+
+
+@serve_group.command(
+    "add-team-member",
+    help="Add a user to a team within their org (W6.3 follow-up).",
+)
+@click.argument("email")
+@click.argument("team_slug")
+@click.argument("org_slug")
+@click.option("--db-url", default=None, envvar="CLAUDESTRUCT_DATABASE_URL")
+def serve_add_team_member(
+    email: str, team_slug: str, org_slug: str, db_url: str | None,
+) -> None:
+    """User must already belong to the org via `cs serve add-user`.
+    A user joining a team they're not in the org of is rejected —
+    teams are intra-org sub-groupings, not cross-org sharing.
+    Idempotent on (team, user) — re-runs are no-ops."""
+    _ensure_server_deps()
+    from sqlalchemy import select
+
+    from claudestruct.server.db import init_db, make_engine, make_session_factory
+    from claudestruct.server.models import (
+        Membership,
+        Org,
+        Team,
+        TeamMembership,
+        User,
+    )
+
+    engine = make_engine(db_url)
+    init_db(engine)
+    factory = make_session_factory(engine)
+    with factory() as session:
+        org = session.execute(
+            select(Org).where(Org.slug == org_slug)
+        ).scalar_one_or_none()
+        if org is None:
+            raise click.ClickException(f"org '{org_slug}' not found.")
+        team = session.execute(
+            select(Team).where(Team.org_id == org.id, Team.slug == team_slug)
+        ).scalar_one_or_none()
+        if team is None:
+            raise click.ClickException(
+                f"team '{team_slug}' not found in org '{org_slug}'; "
+                f"run `cs serve add-team {team_slug} '<name>' {org_slug}` first."
+            )
+        user = session.execute(
+            select(User).where(User.email == email)
+        ).scalar_one_or_none()
+        if user is None:
+            raise click.ClickException(f"user '{email}' not found.")
+        # Belt-and-braces: user must already be in the org. Without
+        # this check a typo could quietly grant cross-org access via
+        # a team-scoped query later.
+        membership = session.execute(
+            select(Membership).where(
+                Membership.user_id == user.id,
+                Membership.org_id == org.id,
+            )
+        ).scalar_one_or_none()
+        if membership is None:
+            raise click.ClickException(
+                f"user '{email}' is not in org '{org_slug}'; "
+                f"run `cs serve add-user` first."
+            )
+        existing = session.execute(
+            select(TeamMembership).where(
+                TeamMembership.team_id == team.id,
+                TeamMembership.user_id == user.id,
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            click.echo(
+                f"user '{email}' is already on team '{team_slug}'"
+            )
+            return
+        session.add(TeamMembership(team_id=team.id, user_id=user.id))
+        session.commit()
+        click.echo(
+            f"added user '{email}' to team '{team_slug}' in org '{org_slug}'"
+        )
+
+
 @serve_group.command("add-key", help="Mint an API key for a user in an org.")
 @click.argument("email")
 @click.argument("org_slug")

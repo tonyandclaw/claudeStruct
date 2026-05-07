@@ -22,7 +22,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from enum import Enum
 
-from sqlalchemy import DateTime, ForeignKey, String
+from sqlalchemy import DateTime, ForeignKey, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from claudestruct.server.db import Base
@@ -51,6 +51,13 @@ class Org(Base):
 
     memberships: Mapped[list[Membership]] = relationship(
         back_populates="org", cascade="all, delete-orphan"
+    )
+    # Teams (W6.3 follow-up). Cascade so deleting an org cleans up
+    # its teams + their memberships in one step. SQLite doesn't
+    # enforce ondelete=CASCADE without the foreign_keys pragma, so
+    # we rely on the ORM-level cascade for deterministic behaviour.
+    teams: Mapped[list[Team]] = relationship(
+        cascade="all, delete-orphan",
     )
 
 
@@ -100,6 +107,63 @@ class ApiKey(Base):
 
     def is_active(self) -> bool:
         return self.revoked_at is None
+
+
+# --- Teams (W6.3 follow-up) ----------------------------------------
+#
+# `Membership` is flat: a user belongs to an org with a role. Teams
+# add a sub-grouping inside the org for delegated admin and per-team
+# rollups (e.g. dashboard filtered to "platform-eng" runs).
+#
+# Schema choice: separate `teams` + `team_memberships` tables rather
+# than a `team_id` column on `Membership` so a user can belong to
+# multiple teams within the same org without duplicating their org
+# membership row. The org membership stays the source of truth for
+# RBAC; teams are organisational metadata + a future filter axis.
+
+
+class Team(Base):
+    __tablename__ = "teams"
+    __table_args__ = (
+        # A team's slug must be unique within an org but two orgs
+        # can each have a `platform-eng` team without colliding.
+        UniqueConstraint("org_id", "slug", name="uq_team_org_slug"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    org_id: Mapped[int] = mapped_column(
+        ForeignKey("orgs.id", ondelete="CASCADE"), index=True,
+    )
+    slug: Mapped[str] = mapped_column(String(64), index=True)
+    name: Mapped[str] = mapped_column(String(255))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now_utc,
+    )
+
+    memberships: Mapped[list[TeamMembership]] = relationship(
+        back_populates="team", cascade="all, delete-orphan",
+    )
+
+
+class TeamMembership(Base):
+    __tablename__ = "team_memberships"
+    __table_args__ = (
+        # A user can only appear once on a given team.
+        UniqueConstraint("team_id", "user_id", name="uq_team_member"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    team_id: Mapped[int] = mapped_column(
+        ForeignKey("teams.id", ondelete="CASCADE"), index=True,
+    )
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now_utc,
+    )
+
+    team: Mapped[Team] = relationship(back_populates="memberships")
 
 
 class RunStatus(str, Enum):
