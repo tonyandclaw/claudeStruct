@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import PlainTextResponse
+from sqlalchemy import select
 
 from claudestruct.server import auth as auth_mod
 from claudestruct.server import billing as billing_mod
@@ -27,7 +28,6 @@ from claudestruct.server.schema import (
     SloWindow,
     TenantSloResponse,
 )
-from sqlalchemy import select
 
 router = APIRouter(tags=["slo"])
 

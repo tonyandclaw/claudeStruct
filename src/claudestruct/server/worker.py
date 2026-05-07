@@ -274,7 +274,7 @@ def _post_completed_check_run_safe(run: Run) -> None:
             close()
 
 
-def _open_pr_as_bot_safe(run: Run, run_root: Path) -> None:
+def _open_pr_as_bot_safe(session: Session, run: Run, run_root: Path) -> None:
     """Open a PR as the GitHub App after a successful run.
 
     Uses the repo + base branch captured at webhook time to create a
@@ -493,7 +493,7 @@ def process_pending_run(
     log.info("worker run %s done: cost=$%.4f", run.run_id, run.cost_usd)
     _post_verdict_comment_safe(run)
     _post_completed_check_run_safe(run)
-    _open_pr_as_bot_safe(run, run_root)
+    _open_pr_as_bot_safe(session, run, run_root)
     return run
 
 

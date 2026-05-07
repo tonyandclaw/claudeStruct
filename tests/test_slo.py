@@ -16,7 +16,7 @@ from sqlalchemy.pool import StaticPool
 from claudestruct.server import slo as slo_mod
 from claudestruct.server.app import create_app
 from claudestruct.server.db import init_db, make_session_factory
-from claudestruct.server.models import Membership, Org, Run, RunStatus, Role, User
+from claudestruct.server.models import Membership, Org, Role, Run, RunStatus, User
 
 # --- Fixtures -------------------------------------------------------
 
@@ -436,7 +436,6 @@ def test_tenant_slo_401_without_auth(env):
 
 def test_tenant_slo_200_with_viewer_role(env):
     """Viewer+ can call the per-tenant SLO endpoint."""
-    from tests.test_audit import _auth
     # The env fixture uses email "root@acme.test" with no key set up.
     # Use the same pattern as test_audit to create an auth key.
     # Since the test_slo env fixture doesn't expose keys, we test via
