@@ -13,7 +13,11 @@ COPY claw-sandbox/ ./
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/claw-sandbox .
 
 # --- Stage 2: build claw-squad (TypeScript) -------------------------
-FROM node:22-alpine AS ts-builder
+#
+# Keep this Debian-based so the Node binary copied into the final
+# python:slim image uses the same glibc runtime. Alpine's musl-built
+# node binary will not run reliably after being copied into Debian.
+FROM node:22-bookworm-slim AS ts-builder
 WORKDIR /app
 RUN npm install -g pnpm@10
 COPY claw-squad/package.json claw-squad/pnpm-lock.yaml ./
@@ -27,9 +31,10 @@ RUN pnpm prune --prod
 FROM python:3.12-slim AS runtime
 
 # git is needed for the context-gather step (`cs` shells out to git);
-# ca-certificates is needed for HTTPS to the Anthropic API.
+# ca-certificates is needed for HTTPS to the provider APIs; libstdc++6
+# is a runtime dependency of the Node binary copied from the builder.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends git ca-certificates \
+    && apt-get install -y --no-install-recommends git ca-certificates libstdc++6 \
     && rm -rf /var/lib/apt/lists/*
 
 # Node runtime for claw-squad. Pulled from the official Node image rather
@@ -49,11 +54,14 @@ RUN printf '#!/bin/sh\nexec node /opt/claw-squad/dist/cli.js "$@"\n' > /usr/loca
     && chmod +x /usr/local/bin/claw-squad
 
 # claudestruct (`cs`) — install from source so the package metadata matches
-# the published wheel format expected by `cs --help`.
+# the published wheel format expected by `cs --help`. The container is
+# the "batteries included" distribution path for server + local-provider
+# use; voice is intentionally omitted because it pulls audio / Whisper
+# runtime dependencies that are rarely useful inside a generic container.
 WORKDIR /opt/claudestruct
 COPY pyproject.toml README.md ./
 COPY src ./src
-RUN pip install --no-cache-dir .
+RUN pip install --no-cache-dir '.[server,openai,smart-context,otel,sentry]'
 
 # Run as a non-root user. Most claudestruct workflows operate on a
 # bind-mounted repo at /workspace, so make that the working directory.

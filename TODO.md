@@ -151,7 +151,7 @@ Goal: anyone can `pip install claudestruct` / `npm install claw-squad` / `docker
   - `CONTRIBUTING.md`, `SECURITY.md` (vuln disclosure)
   - `CHANGELOG.md` (keepachangelog 1.1 format) seeded with Waves 1-3 history
   - `CODE_OF_CONDUCT.md` — official Contributor Covenant 2.1 fetched from `contributor-covenant.org`; `[INSERT CONTACT METHOD]` swapped to point at `SECURITY.md`
-- [~] **W4.3 — Release automation**
+- [x] **W4.3 — Release automation**
   - `.github/workflows/release.yml` — on `v*.*.*` tag push: PyPI sdist+wheel via OIDC trusted publishing, npm publish (`claw-squad`) with `--provenance`, GitHub Release with cross-compiled `claw-sandbox` binaries (linux/darwin × amd64/arm64) + aggregated `SHA256SUMS`
   - Workflow uses `env:` block routing for every shell-substituted ref to keep template injection out of `run:` bodies
   - Trusted-publishing config (PyPI project + npm package settings) is the remaining manual step before the first tag
@@ -210,7 +210,7 @@ Goal: trust this in CI pipelines and long-running daemons. Wave 4 makes it insta
   - `src/claudestruct/budget.py` — `current_period_spend(root)` folds `<root>/.claudestruct/runs/*.jsonl` for the current UTC calendar month; `check_budget(root, cap)` returns `BudgetStatus(spent, cap, warn_threshold, exceeded, near_limit)` with `WARN_FRACTION = 0.8`
   - CLI: new `--monthly-cap-usd <float>` flag on `cs dev/review/plan/debug` (also reads `CLAUDESTRUCT_MONTHLY_CAP_USD`); hard-aborts (`exit 2`) before any LLM call when `spent ≥ cap`, soft-warns when `spent ≥ 0.8 × cap`. Skipped on `--dry-run`.
   - Tests: `tests/test_budget.py` (11 cases) — month bounds incl. December roll-over, period filtering, naive ISO timestamps, exact-threshold semantics, `cap=0` disables check, malformed run skipped
-- [~] **W5.7 — Test rigor**
+- [x] **W5.7 — Test rigor**
   - Ruff lint config in `pyproject.toml` (select F/E/W/I/B/UP/SIM, opinionated rules silenced); CI runs `ruff check src/ tests/` before pytest
   - Coverage gate via `coverage` (`fail_under = 70`; current run hits 80% with CLI/MCP entry points excluded as integration-tested)
   - CI workflow installs `pytest coverage ruff` and runs lint → coverage-gated pytest

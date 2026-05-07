@@ -18,6 +18,7 @@
  */
 
 import { MCP_TOOLS, type ToolDescriptor } from "./handlers.js";
+import { VERSION } from "../version.js";
 
 /**
  * Result of `tools/call` after a handler runs. The MCP SDK expects
@@ -82,7 +83,7 @@ export async function runMcpServer(): Promise<void> {
   const { ListToolsRequestSchema, CallToolRequestSchema } = sdkTypes;
 
   const server = new Server(
-    { name: "claw-squad", version: "0.1.0" },
+    { name: "claw-squad", version: VERSION },
     { capabilities: { tools: {} } },
   );
 
