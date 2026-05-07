@@ -23,6 +23,7 @@ from datetime import datetime
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from claudestruct import dashboard as dash_mod
@@ -30,7 +31,7 @@ from claudestruct import secrets as secrets_mod
 from claudestruct.server import audit as audit_mod
 from claudestruct.server import auth as auth_mod
 from claudestruct.server import billing as billing_mod
-from claudestruct.server.models import Role
+from claudestruct.server.models import Org, Role
 from claudestruct.server.schema import (
     CheckoutRequest,
     CheckoutResponse,
@@ -72,16 +73,16 @@ def create_checkout(
 ) -> CheckoutResponse:
     tier = billing_mod.Tier(body.tier)
     if billing_mod.stripe_sdk_available():
-        # Real Stripe Checkout integration ships behind the
-        # `claudestruct[hosted]` extra. The OSS path always falls
-        # through to the stub so the route is testable end-to-end
-        # without merchant keys in CI.
-        session_id, url = billing_mod.stub_checkout_url(
-            org_slug=principal.org_slug, tier=tier,
+        session_id, url = billing_mod.create_stripe_checkout_session(
+            org_slug=principal.org_slug,
+            tier=tier,
+            success_url=body.success_url,
+            cancel_url=body.cancel_url,
         )
     else:
         session_id, url = billing_mod.stub_checkout_url(
-            org_slug=principal.org_slug, tier=tier,
+            org_slug=principal.org_slug,
+            tier=tier,
         )
     audit_mod.record(
         session,
@@ -175,15 +176,213 @@ async def stripe_webhook(
     except (stripe.SignatureVerificationError, ValueError) as exc:  # type: ignore[attr-defined]
         raise HTTPException(status_code=400, detail=f"invalid signature: {exc}") from exc
 
-    # Minimal dispatcher: real handlers land alongside the live
-    # checkout integration. For now we audit the receipt + ack.
+    _handle_stripe_event(session, event)
+    session.commit()
+
+
+def _handle_stripe_event(session: Session, event) -> None:
+    """Route a verified Stripe event to the appropriate handler."""
+    handlers = {
+        "checkout.session.completed": _handle_checkout_completed,
+        "customer.subscription.updated": _handle_subscription_updated,
+        "customer.subscription.deleted": _handle_subscription_deleted,
+        "invoice.payment_succeeded": _handle_invoice_payment_succeeded,
+        "invoice.payment_failed": _handle_invoice_payment_failed,
+    }
+    handler = handlers.get(event.get("type", ""))
+    if handler:
+        handler(session, event)
+    else:
+        audit_mod.record(
+            session,
+            org_id=0,
+            actor_user_id=None,
+            action=f"stripe.{event.get('type', 'unknown')}",
+            resource_type="stripe_event",
+            resource_id=str(event.get("id", "")),
+            payload={"type": event.get("type")},
+        )
+
+
+def _handle_checkout_completed(session: Session, event) -> None:
+    """Transition org to the paid tier after successful checkout payment."""
+    obj = event.get("object", "")
+    if obj != "checkout.session":
+        return
+
+    customer_id: str | None = event.get("customer")
+    subscription_id: str | None = event.get("subscription")
+    metadata: dict = event.get("metadata", {})
+    org_slug = metadata.get("org_slug")
+    tier_str = metadata.get("tier")
+
+    if not org_slug or not tier_str:
+        audit_mod.record(
+            session, org_id=0, actor_user_id=None,
+            action="stripe.checkout.session.completed.invalid_metadata",
+            resource_type="stripe_event",
+            resource_id=str(event.get("id", "")),
+            payload={"org_slug": org_slug, "tier": tier_str},
+        )
+        return
+
+    org = session.execute(
+        select(Org).where(Org.slug == org_slug)
+    ).scalar_one_or_none()
+    if org is None:
+        return
+
+    sub = billing_mod.get_or_default(session, org.id)
+    sub.stripe_customer_id = customer_id
+    sub.stripe_subscription_id = subscription_id
+    sub.tier = tier_str
+    sub.status = "active"
+    if subscription_id:
+        _update_subscription_period(session, sub, subscription_id)
+
     audit_mod.record(
         session,
-        org_id=0,  # Stripe events aren't tied to a single org until we resolve customer_id
+        org_id=org.id,
         actor_user_id=None,
-        action=f"stripe.{event.get('type', 'unknown')}",
-        resource_type="stripe_event",
-        resource_id=str(event.get("id", "")),
-        payload={"type": event.get("type")},
+        action="stripe.checkout.session.completed",
+        resource_type="subscription",
+        resource_id=subscription_id or "",
+        payload={"tier": tier_str},
     )
-    session.commit()
+
+
+def _update_subscription_period(session: Session, sub, subscription_id: str) -> None:
+    """Fetch the Stripe subscription and update period bounds on the row."""
+    import stripe  # type: ignore
+
+    try:
+        stripe_sub = stripe.Subscription.retrieve(subscription_id)
+    except Exception:  # noqa: BLE001
+        return
+
+    sub.current_period_start = datetime.fromisoformat(
+        stripe_sub.current_period_start.isoformat()
+    ) if stripe_sub.current_period_start else None
+    sub.current_period_end = datetime.fromisoformat(
+        stripe_sub.current_period_end.isoformat()
+    ) if stripe_sub.current_period_end else None
+
+
+def _handle_subscription_updated(session: Session, event) -> None:
+    """Sync Stripe subscription status + period to our Subscription row."""
+    obj = event.get("object", "")
+    if obj != "customer.subscription":
+        return
+
+    subscription_id = event.get("id", "")
+    customer_id = event.get("customer", "")
+    status = event.get("status")
+
+    sub = session.execute(
+        select(billing_mod.Subscription).where(
+            billing_mod.Subscription.stripe_customer_id == customer_id
+        )
+    ).scalar_one_or_none()
+    if sub is None:
+        return
+
+    sub.status = status
+    _update_subscription_period(session, sub, subscription_id)
+
+    audit_mod.record(
+        session,
+        org_id=sub.org_id,
+        actor_user_id=None,
+        action="stripe.customer.subscription.updated",
+        resource_type="subscription",
+        resource_id=subscription_id,
+        payload={"status": status},
+    )
+
+
+def _handle_subscription_deleted(session: Session, event) -> None:
+    """Downgrade org to free tier when subscription is canceled."""
+    obj = event.get("object", "")
+    if obj != "customer.subscription":
+        return
+
+    subscription_id = event.get("id", "")
+    customer_id = event.get("customer", "")
+
+    sub = session.execute(
+        select(billing_mod.Subscription).where(
+            billing_mod.Subscription.stripe_customer_id == customer_id
+        )
+    ).scalar_one_or_none()
+    if sub is None:
+        return
+
+    sub.tier = billing_mod.Tier.free.value
+    sub.status = "canceled"
+
+    audit_mod.record(
+        session,
+        org_id=sub.org_id,
+        actor_user_id=None,
+        action="stripe.customer.subscription.deleted",
+        resource_type="subscription",
+        resource_id=subscription_id,
+        payload={"tier": "free"},
+    )
+
+
+def _handle_invoice_payment_succeeded(session: Session, event) -> None:
+    """Renew the period bounds when Stripe successfully collects payment."""
+    obj = event.get("object", "")
+    if obj != "invoice":
+        return
+
+    customer_id = event.get("customer", "")
+    subscription_id = event.get("subscription")
+
+    sub = session.execute(
+        select(billing_mod.Subscription).where(
+            billing_mod.Subscription.stripe_customer_id == customer_id
+        )
+    ).scalar_one_or_none()
+    if sub is None or not subscription_id:
+        return
+
+    _update_subscription_period(session, sub, subscription_id)
+
+    audit_mod.record(
+        session,
+        org_id=sub.org_id,
+        actor_user_id=None,
+        action="stripe.invoice.payment_succeeded",
+        resource_type="subscription",
+        resource_id=subscription_id,
+        payload={"period_end": str(sub.current_period_end) if sub.current_period_end else None},
+    )
+
+
+def _handle_invoice_payment_failed(session: Session, event) -> None:
+    """Record payment failure — keep current tier but mark at risk."""
+    obj = event.get("object", "")
+    if obj != "invoice":
+        return
+
+    customer_id = event.get("customer", "")
+    sub = session.execute(
+        select(billing_mod.Subscription).where(
+            billing_mod.Subscription.stripe_customer_id == customer_id
+        )
+    ).scalar_one_or_none()
+    if sub is None:
+        return
+
+    sub.status = "past_due"
+    audit_mod.record(
+        session,
+        org_id=sub.org_id,
+        actor_user_id=None,
+        action="stripe.invoice.payment_failed",
+        resource_type="subscription",
+        resource_id=str(event.get("id", "")),
+        payload={},
+    )
