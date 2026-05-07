@@ -910,8 +910,10 @@ def _run_git(
             text=True,
             timeout=timeout,
         )
-    except subprocess.TimeoutExpired:
-        raise GitHubAppError(f"git command timed out after {timeout}s: {' '.join(cmd)}")
+    except subprocess.TimeoutExpired as exc:
+        raise GitHubAppError(
+            f"git command timed out after {timeout}s: {' '.join(cmd)}"
+        ) from exc
     if result.returncode != 0:
         raise GitHubAppError(
             f"git {' '.join(cmd)} failed (exit {result.returncode}): {result.stderr.strip()}"
@@ -928,7 +930,7 @@ def _git_credential_approve(
     """Store a git credential so subsequent push operations succeed."""
     input_str = f"url={repo_url}\nusername={username}\npassword={password}\n"
     try:
-        result = subprocess.run(
+        subprocess.run(
             ["git", "credential", "approve"],
             input=input_str,
             cwd=str(cwd),
@@ -1112,7 +1114,6 @@ def open_pr_as_bot(
 
     # Temp dir for the clone — cleaned up by the caller via
     # ``shutil.rmtree(clone_dir, ignore_errors=True)``.
-    import tempfile, shutil
     clone_dir = Path(tempfile.mkdtemp(prefix="claudestruct-pr-"))
 
     try:
