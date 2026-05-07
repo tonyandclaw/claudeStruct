@@ -66,9 +66,6 @@ importers:
       '@types/react':
         specifier: ^19.2.14
         version: 19.2.14
-      '@types/redis':
-        specifier: ^4.0.10
-        version: 4.0.11(@opentelemetry/api@1.9.1)
       '@types/ws':
         specifier: ^8.18.1
         version: 8.18.1
@@ -881,10 +878,6 @@ packages:
 
   '@types/react@19.2.14':
     resolution: {integrity: sha512-ilcTH/UniCkMdtexkoCN0bI7pMcJDvmQFPvuPvmEaYA/NSfFTAgdUSLAoVjaRJm7+6PvcM+q1zYOwS4wTYMF9w==}
-
-  '@types/redis@4.0.11':
-    resolution: {integrity: sha512-bI+gth8La8Wg/QCR1+V1fhrL9+LZUSWfcqpOj2Kc80ZQ4ffbdL173vQd5wovmoV9i071FU9oP2g6etLuEwb6Rg==}
-    deprecated: This is a stub types definition. redis provides its own type definitions, so you do not need this installed.
 
   '@types/retry@0.12.0':
     resolution: {integrity: sha512-wWKOClTTiizcZhXnPY4wikVAwmdYHp8q6DmC+EJUzAMsycb7HB32Kh9RN4+0gExjmPmZSAQjgURXIGATPegAvA==}
@@ -2573,13 +2566,6 @@ snapshots:
   '@types/react@19.2.14':
     dependencies:
       csstype: 3.2.3
-
-  '@types/redis@4.0.11(@opentelemetry/api@1.9.1)':
-    dependencies:
-      redis: 5.12.1(@opentelemetry/api@1.9.1)
-    transitivePeerDependencies:
-      - '@node-rs/xxhash'
-      - '@opentelemetry/api'
 
   '@types/retry@0.12.0': {}
 

@@ -35,6 +35,10 @@ server = [
   # turned on for an org -- lazy-loading would just defer the pip
   # install, not the import cost.
   "cryptography>=42.0",
+  # Alembic for schema migrations (W6.3). `cs serve migrate` and the
+  # test_alembic suite both import alembic.config; a hard dep here
+  # keeps the lean install path off the server bundle.
+  "alembic>=1.13",
 ]
 # `pip install claudestruct[otel]` to enable OpenTelemetry tracing.
 # Without this extra, tracing.py falls back to no-op spans and prints
