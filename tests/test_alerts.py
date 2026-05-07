@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import math
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 import pytest
 
@@ -493,3 +494,350 @@ def test_default_notifier_unknown_provider_raises(monkeypatch):
     monkeypatch.setenv("CLAUDESTRUCT_NOTIFY_PROVIDER", "carrier-pigeon")
     with pytest.raises(RuntimeError, match="unknown"):
         notify_mod.default_notifier()
+
+
+# --- EmailNotifier --------------------------------------------------
+
+
+class _FakeSMTP:
+    """Captures SMTP traffic for EmailNotifier tests.
+
+    Mirrors enough of the ``smtplib.SMTP`` surface that ``EmailNotifier``
+    can drive it: ``starttls`` / ``login`` / ``send_message`` / ``quit``.
+    """
+
+    def __init__(self) -> None:
+        self.host: str | None = None
+        self.port: int | None = None
+        self.starttls_called = False
+        self.login_args: tuple[str, str] | None = None
+        self.sent: list[Any] = []
+        self.quit_called = False
+        self.starttls_exc: Exception | None = None
+        self.login_exc: Exception | None = None
+        self.send_exc: Exception | None = None
+
+    def starttls(self) -> None:
+        self.starttls_called = True
+        if self.starttls_exc is not None:
+            raise self.starttls_exc
+
+    def login(self, user: str, password: str) -> None:
+        self.login_args = (user, password)
+        if self.login_exc is not None:
+            raise self.login_exc
+
+    def send_message(self, msg: Any) -> None:
+        if self.send_exc is not None:
+            raise self.send_exc
+        self.sent.append(msg)
+
+    def quit(self) -> None:
+        self.quit_called = True
+
+
+def _email_notifier(smtp: _FakeSMTP, **overrides) -> notify_mod.EmailNotifier:
+    """Common EmailNotifier ctor wrapper for tests."""
+    def factory(host: str, port: int) -> _FakeSMTP:
+        smtp.host = host
+        smtp.port = port
+        return smtp
+
+    kwargs: dict[str, Any] = dict(
+        host="smtp.example.com",
+        port=587,
+        sender="alerts@example.com",
+        recipients=["oncall@example.com"],
+        smtp_factory=factory,
+    )
+    kwargs.update(overrides)
+    return notify_mod.EmailNotifier(**kwargs)
+
+
+def test_email_notifier_rejects_empty_host():
+    with pytest.raises(ValueError, match="SMTP host"):
+        notify_mod.EmailNotifier(
+            host="",
+            sender="a@b.test",
+            recipients=["c@d.test"],
+        )
+
+
+def test_email_notifier_rejects_empty_sender():
+    with pytest.raises(ValueError, match="sender"):
+        notify_mod.EmailNotifier(
+            host="smtp.example.com",
+            sender="",
+            recipients=["c@d.test"],
+        )
+
+
+def test_email_notifier_rejects_no_recipients():
+    with pytest.raises(ValueError, match="recipient"):
+        notify_mod.EmailNotifier(
+            host="smtp.example.com",
+            sender="a@b.test",
+            recipients=[],
+        )
+
+
+def test_email_notifier_sends_message_with_starttls_and_login():
+    smtp = _FakeSMTP()
+    notifier = _email_notifier(
+        smtp,
+        username="alerts@example.com",
+        password="hunter2",
+        recipients=["oncall@example.com", "sre@example.com"],
+    )
+    alert = notify_mod.Alert(
+        kind="cost_regression",
+        severity="critical",
+        org_slug="acme",
+        summary="run r1 cost $10 is 5σ above mean",
+        details={"run_id": "r1", "sigma_above": 5.0},
+    )
+    notifier.notify(alert)
+
+    assert smtp.starttls_called is True
+    assert smtp.login_args == ("alerts@example.com", "hunter2")
+    assert len(smtp.sent) == 1
+    msg = smtp.sent[0]
+    assert "[CRITICAL]" in msg["Subject"]
+    assert "acme" in msg["Subject"]
+    # Multiple recipients render as a comma-joined To header.
+    assert "oncall@example.com" in msg["To"]
+    assert "sre@example.com" in msg["To"]
+    body = msg.get_content()
+    assert "Severity: critical" in body
+    assert "run_id: r1" in body
+    assert smtp.quit_called is True
+
+
+def test_email_notifier_skips_login_when_no_credentials():
+    smtp = _FakeSMTP()
+    notifier = _email_notifier(smtp, use_starttls=False)
+    notifier.notify(notify_mod.Alert(
+        kind="x", severity="info", org_slug="acme",
+        summary="s", details={},
+    ))
+    assert smtp.starttls_called is False
+    assert smtp.login_args is None
+    assert len(smtp.sent) == 1
+
+
+def test_email_notifier_swallows_send_failure(caplog):
+    smtp = _FakeSMTP()
+    smtp.send_exc = RuntimeError("connection reset")
+    notifier = _email_notifier(smtp)
+    with caplog.at_level("WARNING", logger="claudestruct.notify"):
+        notifier.notify(notify_mod.Alert(
+            kind="x", severity="info", org_slug="acme",
+            summary="s", details={},
+        ))
+    assert any("send failed" in r.message for r in caplog.records)
+    assert smtp.quit_called is True  # quit always runs in finally
+
+
+def test_email_notifier_swallows_login_failure_without_sending(caplog):
+    smtp = _FakeSMTP()
+    smtp.login_exc = RuntimeError("auth rejected")
+    notifier = _email_notifier(
+        smtp, username="u", password="p",
+    )
+    with caplog.at_level("WARNING", logger="claudestruct.notify"):
+        notifier.notify(notify_mod.Alert(
+            kind="x", severity="info", org_slug="acme",
+            summary="s", details={},
+        ))
+    assert any("login failed" in r.message for r in caplog.records)
+    assert smtp.sent == []  # login failure short-circuits before send
+
+
+def test_email_notifier_swallows_starttls_failure_and_continues_to_send(caplog):
+    """STARTTLS refusal logs but still attempts the send — matches
+    Slack's swallow-and-log policy so cron jobs don't die on a TLS
+    misconfig that the operator can fix later."""
+    smtp = _FakeSMTP()
+    smtp.starttls_exc = RuntimeError("server refused starttls")
+    notifier = _email_notifier(smtp)
+    with caplog.at_level("WARNING", logger="claudestruct.notify"):
+        notifier.notify(notify_mod.Alert(
+            kind="x", severity="info", org_slug="acme",
+            summary="s", details={},
+        ))
+    assert any("starttls failed" in r.message for r in caplog.records)
+    assert len(smtp.sent) == 1
+
+
+def test_email_notifier_swallows_connect_failure(caplog):
+    """SMTP connect failure must not bubble up to the caller — matches
+    SlackWebhookNotifier behaviour so the cron driver stays alive."""
+    def factory(host: str, port: int) -> _FakeSMTP:
+        raise OSError("connection refused")
+
+    notifier = notify_mod.EmailNotifier(
+        host="smtp.example.com",
+        sender="a@b.test",
+        recipients=["c@d.test"],
+        smtp_factory=factory,
+    )
+    with caplog.at_level("WARNING", logger="claudestruct.notify"):
+        notifier.notify(notify_mod.Alert(
+            kind="x", severity="info", org_slug="acme",
+            summary="s", details={},
+        ))
+    assert any("smtp connect failed" in r.message for r in caplog.records)
+
+
+def test_split_recipients_handles_mixed_separators():
+    out = notify_mod._split_recipients("a@x.test, b@x.test;c@x.test , ")
+    assert out == ["a@x.test", "b@x.test", "c@x.test"]
+
+
+def test_default_notifier_returns_email_when_configured(monkeypatch):
+    monkeypatch.setenv("CLAUDESTRUCT_NOTIFY_PROVIDER", "email")
+    monkeypatch.setenv("CLAUDESTRUCT_SMTP_HOST", "smtp.example.com")
+    monkeypatch.setenv("CLAUDESTRUCT_SMTP_FROM", "alerts@example.com")
+    monkeypatch.setenv("CLAUDESTRUCT_SMTP_TO", "oncall@example.com")
+    monkeypatch.setenv("CLAUDESTRUCT_SMTP_PORT", "2525")
+    monkeypatch.setenv("CLAUDESTRUCT_SMTP_STARTTLS", "0")
+    n = notify_mod.default_notifier()
+    assert n.name == "email"
+    assert n._port == 2525
+    assert n._use_starttls is False
+    assert n._recipients == ["oncall@example.com"]
+
+
+def test_default_notifier_email_missing_host_raises(monkeypatch):
+    monkeypatch.setenv("CLAUDESTRUCT_NOTIFY_PROVIDER", "email")
+    monkeypatch.delenv("CLAUDESTRUCT_SMTP_HOST", raising=False)
+    monkeypatch.setenv("CLAUDESTRUCT_SMTP_FROM", "alerts@example.com")
+    monkeypatch.setenv("CLAUDESTRUCT_SMTP_TO", "oncall@example.com")
+    with pytest.raises(RuntimeError, match="CLAUDESTRUCT_SMTP_HOST"):
+        notify_mod.default_notifier()
+
+
+def test_default_notifier_email_missing_recipients_raises(monkeypatch):
+    monkeypatch.setenv("CLAUDESTRUCT_NOTIFY_PROVIDER", "email")
+    monkeypatch.setenv("CLAUDESTRUCT_SMTP_HOST", "smtp.example.com")
+    monkeypatch.setenv("CLAUDESTRUCT_SMTP_FROM", "alerts@example.com")
+    monkeypatch.delenv("CLAUDESTRUCT_SMTP_TO", raising=False)
+    with pytest.raises(RuntimeError, match="CLAUDESTRUCT_SMTP_TO"):
+        notify_mod.default_notifier()
+
+
+def test_default_notifier_email_invalid_port_raises(monkeypatch):
+    monkeypatch.setenv("CLAUDESTRUCT_NOTIFY_PROVIDER", "email")
+    monkeypatch.setenv("CLAUDESTRUCT_SMTP_HOST", "smtp.example.com")
+    monkeypatch.setenv("CLAUDESTRUCT_SMTP_FROM", "alerts@example.com")
+    monkeypatch.setenv("CLAUDESTRUCT_SMTP_TO", "oncall@example.com")
+    monkeypatch.setenv("CLAUDESTRUCT_SMTP_PORT", "not-a-number")
+    with pytest.raises(RuntimeError, match="not a valid integer"):
+        notify_mod.default_notifier()
+
+
+# --- cs serve alerts --watch (scheduler mode) ----------------------
+
+
+def test_serve_alerts_watch_runs_bounded_passes_then_exits(tmp_path, monkeypatch):
+    """`cs serve alerts --watch --max-iterations 2` must call the
+    detector twice + sleep once between, then exit 0. Uses a no-op
+    sleep monkeypatch so the test stays fast."""
+    from click.testing import CliRunner
+
+    from claudestruct.server.cli import serve_group
+
+    # Sleep stub: record durations + return immediately. Lets us pin
+    # the loop's interval semantics without an actual wall-clock wait.
+    sleeps: list[float] = []
+    monkeypatch.setattr(
+        "time.sleep",
+        lambda s: sleeps.append(s),
+    )
+
+    monkeypatch.setenv("CLAUDESTRUCT_NOTIFY_PROVIDER", "log")
+
+    db_url = "sqlite:///" + str(tmp_path / "watch.db")
+    result = CliRunner().invoke(
+        serve_group,
+        [
+            "alerts",
+            "--db-url", db_url,
+            "--watch",
+            "--interval", "5",
+            "--max-iterations", "2",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    # First pass + sleep + second pass — N-1 sleeps for N iterations.
+    assert sleeps == [5]
+    # Both passes log a dispatched-count line.
+    assert "alerts[1]:" in result.output
+    assert "alerts[2]:" in result.output
+
+
+def test_serve_alerts_watch_invalid_interval_rejected(tmp_path):
+    """`--interval 0` (or negative) is a config error — exit non-zero
+    with a clear message rather than spinning at full CPU."""
+    from click.testing import CliRunner
+
+    from claudestruct.server.cli import serve_group
+
+    db_url = "sqlite:///" + str(tmp_path / "bad.db")
+    result = CliRunner().invoke(
+        serve_group,
+        [
+            "alerts",
+            "--db-url", db_url,
+            "--watch",
+            "--interval", "0",
+            "--max-iterations", "1",
+        ],
+    )
+    assert result.exit_code != 0
+    assert "--interval must be > 0" in result.output
+
+
+def test_serve_alerts_watch_continues_after_pass_error(tmp_path, monkeypatch):
+    """A transient failure in one pass (DB blip, etc.) must NOT tear
+    the watcher down — log the error and keep polling. Verified by
+    forcing the first call to ``compute_cost_regression_alerts`` to
+    raise, then letting the second call succeed."""
+    from click.testing import CliRunner
+
+    from claudestruct.server import cli as cli_mod
+    from claudestruct.server.alerts import compute_cost_regression_alerts
+
+    monkeypatch.setattr("time.sleep", lambda s: None)
+    monkeypatch.setenv("CLAUDESTRUCT_NOTIFY_PROVIDER", "log")
+
+    real_calls: list[int] = []
+
+    def flaky(session, **kwargs):
+        real_calls.append(1)
+        if len(real_calls) == 1:
+            raise RuntimeError("transient db blip")
+        return compute_cost_regression_alerts(session, **kwargs)
+
+    monkeypatch.setattr(
+        "claudestruct.server.alerts.compute_cost_regression_alerts",
+        flaky,
+    )
+
+    db_url = "sqlite:///" + str(tmp_path / "flaky.db")
+    result = CliRunner().invoke(
+        cli_mod.serve_group,
+        [
+            "alerts",
+            "--db-url", db_url,
+            "--watch",
+            "--interval", "1",
+            "--max-iterations", "2",
+        ],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0
+    assert len(real_calls) == 2
+    # The first pass's error surfaces but the loop survives.
+    combined = result.output + (result.stderr if result.stderr else "")
+    assert "transient db blip" in combined or "error" in combined.lower()

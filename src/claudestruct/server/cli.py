@@ -451,15 +451,29 @@ def serve_worker(db_url: str | None, run_root: str, once: bool,
               help="Baseline window for the mean+stddev calculation.")
 @click.option("--check-recent-hours", type=int, default=24, show_default=True,
               help="Window of recent runs to evaluate against the baseline.")
+@click.option("--watch", is_flag=True, default=False,
+              help="Run as a long-lived scheduler instead of one-shot. "
+                   "Drains alerts every --interval seconds until SIGINT.")
+@click.option("--interval", type=int, default=900, show_default=True,
+              help="Seconds between passes when --watch is set (default 15min).")
+@click.option("--max-iterations", type=int, default=0, show_default=True,
+              help="Cap the watch loop at N passes (0 = unbounded). "
+                   "Test seam — operators leave this at the default.")
 def serve_alerts(db_url: str | None, sigma: float, lookback_days: int,
-                 check_recent_hours: int) -> None:
+                 check_recent_hours: int, watch: bool, interval: int,
+                 max_iterations: int) -> None:
     """Compute cost-regression alerts and dispatch via the notifier (W6.5).
 
     Provider is picked via ``CLAUDESTRUCT_NOTIFY_PROVIDER`` (``log`` by
-    default; set to ``slack`` + ``CLAUDESTRUCT_SLACK_WEBHOOK_URL`` for
-    Slack delivery). Findings flag runs whose cost is more than
-    ``--sigma`` standard deviations above their org's 30-day mean
-    successful-run cost. Run from cron / a Kubernetes CronJob.
+    default; set to ``slack`` + ``CLAUDESTRUCT_SLACK_WEBHOOK_URL`` or
+    ``email`` + ``CLAUDESTRUCT_SMTP_*`` for other channels). Findings
+    flag runs whose cost is more than ``--sigma`` standard deviations
+    above their org's 30-day mean successful-run cost.
+
+    By default this is a one-shot pass — run from cron or a Kubernetes
+    CronJob. Pass ``--watch`` to run as a long-lived daemon that polls
+    every ``--interval`` seconds (suitable for systemd ``Type=simple``
+    deployments next to ``cs serve run``).
     """
     _ensure_server_deps()
     from claudestruct.server.alerts import (
@@ -468,6 +482,9 @@ def serve_alerts(db_url: str | None, sigma: float, lookback_days: int,
     )
     from claudestruct.server.db import init_db, make_engine, make_session_factory
     from claudestruct.server.notify import default_notifier
+
+    if interval <= 0:
+        raise click.ClickException("--interval must be > 0")
 
     engine = make_engine(db_url)
     init_db(engine)
@@ -480,15 +497,43 @@ def serve_alerts(db_url: str | None, sigma: float, lookback_days: int,
         # (cron job alerting on its own setup), not a silent skip.
         raise click.ClickException(str(exc)) from exc
 
-    with factory() as session:
-        findings = compute_cost_regression_alerts(
-            session,
-            sigma=sigma,
-            lookback_days=lookback_days,
-            check_recent_hours=check_recent_hours,
-        )
-        n = dispatch_findings(findings, notifier)
-    click.echo(f"alerts: {n} dispatched via {notifier.name}")
+    def _one_pass() -> int:
+        with factory() as session:
+            findings = compute_cost_regression_alerts(
+                session,
+                sigma=sigma,
+                lookback_days=lookback_days,
+                check_recent_hours=check_recent_hours,
+            )
+            return dispatch_findings(findings, notifier)
+
+    if not watch:
+        n = _one_pass()
+        click.echo(f"alerts: {n} dispatched via {notifier.name}")
+        return
+
+    import time
+    click.echo(
+        f"alerts: watching every {interval}s via {notifier.name} "
+        "(Ctrl-C to stop)"
+    )
+    iteration = 0
+    try:
+        while True:
+            iteration += 1
+            try:
+                n = _one_pass()
+                click.echo(f"alerts[{iteration}]: {n} dispatched")
+            except Exception as exc:  # noqa: BLE001
+                # A transient DB blip shouldn't tear the daemon down —
+                # log + continue. Real misconfigs surface on the next
+                # pass too.
+                click.echo(f"alerts[{iteration}]: error: {exc}", err=True)
+            if max_iterations and iteration >= max_iterations:
+                break
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        click.echo("\nalerts: stopping watcher")
 
 
 def attach_to(main: Any) -> None:
