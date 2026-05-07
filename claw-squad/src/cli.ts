@@ -44,6 +44,7 @@ import {
   isSilentCacheInvalidator,
   type RunTotals,
 } from "./totals.js";
+import { VERSION } from "./version.js";
 
 const program = new Command();
 
@@ -54,7 +55,7 @@ program
   .description(
     "3-agent Claude orchestrator: Planner -> Coder -> Reviewer. Supports Anthropic / OpenAI / Ollama / vLLM / SGLang / Gemini / MiniMax.",
   )
-  .version("0.2.0");
+  .version(VERSION);
 
 const runCmd = program
   .command("run")

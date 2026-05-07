@@ -24,6 +24,12 @@ Pick the tool you want; they install independently.
       dev "your task"
     ```
 
+    The image bundles `cs`, `claw-squad`, and `claw-sandbox`, and installs
+    the `cs` server / OpenAI-compat extras so `cs serve` and local-provider
+    runs work without rebuilding. Voice is intentionally left out of the
+    generic image because microphone and Whisper runtime dependencies are
+    host-specific.
+
 `cs --help` shows every flag. The CLI is one-shot: it gathers context, calls
 Claude once, prints the response, exits.
 
@@ -58,7 +64,7 @@ Run inside Docker or firejail for stronger guarantees.
 | `claw-squad`  | Node ≥ 20                 |
 | `claw-sandbox`| Go ≥ 1.22 (build only)    |
 
-The combined Docker image bundles all three.
+The combined Docker image bundles all three CLI binaries.
 
 ## Distribution channels (W7.7)
 

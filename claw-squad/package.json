@@ -36,7 +36,6 @@
     "@types/picomatch": "^4.0.3",
     "@types/prompts": "^2.4.9",
     "@types/react": "^19.2.14",
-    "@types/redis": "^4.0.10",
     "@types/ws": "^8.18.1",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2",
