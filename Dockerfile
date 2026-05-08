@@ -28,7 +28,7 @@ RUN pnpm exec tsc
 RUN pnpm prune --prod
 
 # --- Stage 3: runtime ----------------------------------------------
-FROM python:3.12-slim AS runtime
+FROM python:3.14-slim AS runtime
 
 # git is needed for the context-gather step (`cs` shells out to git);
 # ca-certificates is needed for HTTPS to the provider APIs; libstdc++6
