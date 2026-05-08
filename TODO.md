@@ -155,10 +155,10 @@ Goal: anyone can `pip install claudestruct` / `npm install claw-squad` / `docker
   - `.github/workflows/release.yml` — on `v*.*.*` tag push: PyPI sdist+wheel via OIDC trusted publishing, npm publish (`claw-squad`) with `--provenance`, GitHub Release with cross-compiled `claw-sandbox` binaries (linux/darwin × amd64/arm64) + aggregated `SHA256SUMS`
   - Workflow uses `env:` block routing for every shell-substituted ref to keep template injection out of `run:` bodies
   - Trusted-publishing config (PyPI project + npm package settings) is the remaining manual step before the first tag
-- [x] **W4.4 — Container distribution**
+- [x] **W4.4 — Container distribution** ✅ (image + SBOM + vuln scan all shipped)
   - Multi-stage `Dockerfile` (python-slim base, Go builder for sandbox, Node builder for claw-squad) → `ghcr.io/tonyandclaw/claudestruct:latest`
   - `.github/workflows/docker.yml` builds on every PR (verifies the Dockerfile) and pushes to GHCR on push to main + on tag, with PR/branch/sha tags via `docker/metadata-action`
-  - SBOM (syft) + vuln scan (trivy) deferred to a follow-up PR alongside W4.3
+  - **Supply-chain gates (this PR)**: `anchore/sbom-action` generates a CycloneDX SBOM after each build; uploaded as a workflow artefact (`sbom-<sha>`) for downstream review. `aquasecurity/trivy-action` scans the image for CRITICAL/HIGH CVEs (`ignore-unfixed: true` to keep noise actionable) and **fails the workflow** on findings. Results upload as SARIF to the GitHub Security tab (`security-events: write` permission added) so findings outlive the workflow run. Locked into place by 5 new tests in `tests/test_dockerfile.py`: SBOM step + cyclonedx format, artefact upload, trivy with `exit-code: '1'` gate covering CRITICAL+HIGH, SARIF upload via `codeql-action/upload-sarif`, and the `security-events: write` permission.
 - [x] **W4.5 — Docs site**
   - mkdocs-material wraps `claw-squad/docs/*.md` + the root README/CHANGELOG/CONTRIBUTING/SECURITY/TODO via `mkdocs-include-markdown-plugin` (single source of truth, no duplicated content)
   - `.github/workflows/docs.yml` builds on every PR (`mkdocs build --strict`) and deploys to GitHub Pages on push to main via `actions/deploy-pages@v4`
