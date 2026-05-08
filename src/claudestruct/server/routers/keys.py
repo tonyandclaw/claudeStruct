@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -36,7 +36,10 @@ def list_keys(
     session: Session = Depends(auth_mod.get_session),
 ) -> KeyList:
     rows = session.execute(
-        select(ApiKey).where(ApiKey.org_id == principal.org_id).order_by(ApiKey.created_at.desc())
+        auth_mod.with_org_scope(
+            select(ApiKey).order_by(ApiKey.created_at.desc()),
+            ApiKey, principal,
+        )
     ).scalars().all()
     return KeyList(keys=[_to_metadata(k) for k in rows])
 
@@ -89,13 +92,12 @@ def revoke_key(
     session: Session = Depends(auth_mod.get_session),
 ) -> None:
     row = session.execute(
-        select(ApiKey).where(
-            ApiKey.key_id == key_id,
-            ApiKey.org_id == principal.org_id,
+        auth_mod.with_org_scope(
+            select(ApiKey).where(ApiKey.key_id == key_id),
+            ApiKey, principal,
         )
     ).scalar_one_or_none()
-    if row is None:
-        raise HTTPException(status_code=404, detail="key not found")
+    auth_mod.require_org_owned(row, principal, label="key")
     if row.revoked_at is None:
         row.revoked_at = datetime.now(timezone.utc)
         audit_mod.record(
