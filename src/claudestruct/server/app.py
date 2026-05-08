@@ -109,6 +109,53 @@ class ApiVersionHeaderMiddleware(BaseHTTPMiddleware):
         return response
 
 
+# Production-readiness — request-ID propagation. The header is the
+# correlation id that ties a single user-facing request to every
+# log line / audit row / outbound call it produced. Critical for
+# debugging "why did this run fail?" across three or four log
+# files.
+REQUEST_ID_HEADER = "X-Request-Id"
+
+
+class RequestIdMiddleware(BaseHTTPMiddleware):
+    """Attach a request id to every request + echo it on responses.
+
+    Resolution: caller-supplied ``X-Request-Id`` header wins (so a
+    proxy / SPA can carry their own correlation id through);
+    otherwise we mint a fresh UUID4. The id is reachable from
+    handlers via ``request.state.request_id``; tests + log
+    correlators can pluck it off either side.
+    """
+
+    async def dispatch(self, request: Request, call_next):  # noqa: D401
+        import uuid
+        rid = request.headers.get(REQUEST_ID_HEADER) or str(uuid.uuid4())
+        request.state.request_id = rid
+        response = await call_next(request)
+        response.headers[REQUEST_ID_HEADER] = rid
+        return response
+
+
+def resolve_cors_origins(override: list[str] | None = None) -> list[str]:
+    """Resolve the allowed-origins list for CORS.
+
+    Priority: explicit override > ``CLAUDESTRUCT_CORS_ORIGINS`` env
+    (comma-separated) > empty list.
+
+    Default is **empty** — same-origin browsers don't trigger CORS,
+    so an SPA hosted on the same domain as the API works without
+    any operator config. Cross-origin SPAs (the typical SaaS shape:
+    api.x.dev + app.x.dev) MUST set the env var explicitly. We
+    deliberately do NOT default to ``"*"`` because the API accepts
+    bearer tokens and a permissive default would let any origin's
+    JS read tenant data once a session cookie is set.
+    """
+    if override is not None:
+        return override
+    raw = os.environ.get("CLAUDESTRUCT_CORS_ORIGINS", "")
+    return [s.strip() for s in raw.split(",") if s.strip()]
+
+
 def create_app(
     *,
     db_url: str | None = None,
@@ -116,6 +163,7 @@ def create_app(
     engine: Any = None,
     skip_init: bool = False,
     region: str | None = None,
+    cors_origins: list[str] | None = None,
 ) -> FastAPI:
     """Build the FastAPI app.
 
@@ -152,9 +200,35 @@ def create_app(
     app.state.run_root = str(run_root) if run_root else "."
     app.state.region = resolve_region(region)
     app.state.latency_tracker = LatencyTracker()
+    app.state.cors_origins = resolve_cors_origins(cors_origins)
+    # CORS is opt-in: empty list means "no Access-Control-Allow-* headers
+    # emitted, browser denies cross-origin reads by default." Set
+    # CLAUDESTRUCT_CORS_ORIGINS=https://app.example.com to allow.
+    if app.state.cors_origins:
+        from fastapi.middleware.cors import CORSMiddleware
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=app.state.cors_origins,
+            # `allow_credentials=True` is required so the SPA can send
+            # the session cookie on cross-origin requests; combined
+            # with the explicit origin list (NOT wildcard) this is
+            # the safe shape per CORS spec.
+            allow_credentials=True,
+            allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+            allow_headers=[
+                "Authorization", "Content-Type", "Idempotency-Key",
+                "X-CS-Api-Version", "Stripe-Signature",
+            ],
+            expose_headers=["X-CS-Region", "X-CS-Api-Version"],
+            max_age=600,
+        )
     app.add_middleware(RequestLatencyMiddleware, tracker=app.state.latency_tracker)
     app.add_middleware(RegionHeaderMiddleware, region=app.state.region)
     app.add_middleware(ApiVersionHeaderMiddleware, version=API_VERSION)
+    # RequestIdMiddleware last so it's the OUTERmost wrapper —
+    # every log / audit row downstream (including from the
+    # latency tracker that sits inside it) sees the id.
+    app.add_middleware(RequestIdMiddleware)
 
     app.include_router(health_router.router)
     app.include_router(keys_router.router)

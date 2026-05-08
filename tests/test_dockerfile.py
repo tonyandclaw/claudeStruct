@@ -13,6 +13,10 @@ def _docker_workflow() -> str:
     ).read_text(encoding="utf-8")
 
 
+def _ci_workflow() -> str:
+    return (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+
+
 def test_node_builder_uses_glibc_runtime_family():
     text = _dockerfile()
 
@@ -76,3 +80,22 @@ def test_docker_workflow_security_events_permission_present():
     the upload step silently no-ops."""
     text = _docker_workflow()
     assert "security-events: write" in text
+
+
+# --- Secret scan in CI --------------------------------------------
+
+
+def test_ci_workflow_runs_gitleaks_secret_scan():
+    """A committed credential is 1000× worse than any test failure;
+    gitleaks must run on every PR + push so a bad commit never
+    makes it past review."""
+    text = _ci_workflow()
+    assert "gitleaks/gitleaks-action" in text
+
+
+def test_ci_workflow_secret_scan_uses_full_history():
+    """gitleaks needs `fetch-depth: 0` to scan every commit the PR
+    introduces — the default depth-1 only sees the merge commit
+    and would miss a secret added in a middle commit."""
+    text = _ci_workflow()
+    assert "fetch-depth: 0" in text
