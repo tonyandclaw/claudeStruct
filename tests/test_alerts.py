@@ -493,3 +493,176 @@ def test_default_notifier_unknown_provider_raises(monkeypatch):
     monkeypatch.setenv("CLAUDESTRUCT_NOTIFY_PROVIDER", "carrier-pigeon")
     with pytest.raises(RuntimeError, match="unknown"):
         notify_mod.default_notifier()
+
+
+# --- EmailNotifier --------------------------------------------------
+
+
+class _FakeSMTP:
+    """Records calls; mimics the subset of smtplib.SMTP that
+    EmailNotifier exercises."""
+
+    def __init__(
+        self,
+        *,
+        starttls_raises: bool = False,
+        login_raises: bool = False,
+        sendmail_raises: bool = False,
+    ) -> None:
+        self.starttls_raises = starttls_raises
+        self.login_raises = login_raises
+        self.sendmail_raises = sendmail_raises
+        self.calls: list[tuple[str, tuple, dict]] = []
+        self.starttls_called = False
+        self.login_args: tuple | None = None
+        self.sendmail_args: tuple | None = None
+        self.quit_called = False
+
+    def starttls(self):
+        self.starttls_called = True
+        if self.starttls_raises:
+            raise RuntimeError("STARTTLS not supported")
+
+    def login(self, username, password):
+        self.login_args = (username, password)
+        if self.login_raises:
+            raise RuntimeError("login failed")
+
+    def sendmail(self, from_addr, to_addrs, msg):
+        self.sendmail_args = (from_addr, to_addrs, msg)
+        if self.sendmail_raises:
+            raise RuntimeError("sendmail failed")
+
+    def quit(self):
+        self.quit_called = True
+
+
+def _make_email_notifier(
+    smtp: _FakeSMTP,
+    *,
+    username: str = "alerts@example.com",
+    to_addrs: list[str] | None = None,
+):
+    return notify_mod.EmailNotifier(
+        smtp_host="smtp.example.com",
+        smtp_port=587,
+        username=username,
+        password="hunter2",
+        from_addr="alerts@example.com",
+        to_addrs=to_addrs or ["oncall@example.com"],
+        smtp_factory=lambda host, port: smtp,
+    )
+
+
+def _email_alert(severity: str = "warning") -> notify_mod.Alert:
+    return notify_mod.Alert(
+        kind="cost_regression",
+        severity=severity,
+        org_slug="acme",
+        summary="run cost spiked 3x",
+        details={"run_id": "abc", "cost_usd": 12.5},
+    )
+
+
+def test_email_notifier_rejects_empty_host():
+    with pytest.raises(ValueError, match="smtp_host"):
+        notify_mod.EmailNotifier(
+            smtp_host="", smtp_port=25, username="", password="",
+            from_addr="x@y", to_addrs=["a@b"],
+        )
+
+
+def test_email_notifier_rejects_empty_to_addrs():
+    with pytest.raises(ValueError, match="to_addr"):
+        notify_mod.EmailNotifier(
+            smtp_host="smtp", smtp_port=25, username="", password="",
+            from_addr="x@y", to_addrs=[],
+        )
+
+
+def test_email_notifier_rejects_empty_from():
+    with pytest.raises(ValueError, match="from_addr"):
+        notify_mod.EmailNotifier(
+            smtp_host="smtp", smtp_port=25, username="", password="",
+            from_addr="", to_addrs=["a@b"],
+        )
+
+
+def test_email_notifier_happy_path_sends_message():
+    smtp = _FakeSMTP()
+    n = _make_email_notifier(smtp)
+    n.notify(_email_alert("warning"))
+
+    assert smtp.starttls_called
+    assert smtp.login_args == ("alerts@example.com", "hunter2")
+    assert smtp.sendmail_args is not None
+    from_addr, to_addrs, msg = smtp.sendmail_args
+    assert from_addr == "alerts@example.com"
+    assert to_addrs == ["oncall@example.com"]
+    # Subject includes severity + org + summary.
+    assert "Subject: [WARNING] acme: run cost spiked 3x" in msg
+    # Body lists each detail key.
+    assert "run_id: abc" in msg
+    assert "cost_usd: 12.5" in msg
+    assert smtp.quit_called
+
+
+def test_email_notifier_skips_login_when_no_username():
+    smtp = _FakeSMTP()
+    n = _make_email_notifier(smtp, username="")
+    n.notify(_email_alert())
+    # login was not called (no creds) but mail still sent.
+    assert smtp.login_args is None
+    assert smtp.sendmail_args is not None
+
+
+def test_email_notifier_drops_alert_if_starttls_unsupported(caplog):
+    smtp = _FakeSMTP(starttls_raises=True)
+    n = _make_email_notifier(smtp)
+    with caplog.at_level("WARNING", logger="claudestruct.notify"):
+        n.notify(_email_alert())
+    # Did not attempt to login or send over plaintext.
+    assert smtp.login_args is None
+    assert smtp.sendmail_args is None
+    assert any("STARTTLS" in r.message for r in caplog.records)
+
+
+def test_email_notifier_swallows_sendmail_failure(caplog):
+    smtp = _FakeSMTP(sendmail_raises=True)
+    n = _make_email_notifier(smtp)
+    with caplog.at_level("WARNING", logger="claudestruct.notify"):
+        n.notify(_email_alert())  # must not raise
+    assert any("sendmail failed" in r.message for r in caplog.records)
+
+
+def test_default_notifier_returns_email_when_configured(monkeypatch):
+    monkeypatch.setenv("CLAUDESTRUCT_NOTIFY_PROVIDER", "email")
+    monkeypatch.setenv("CLAUDESTRUCT_EMAIL_SMTP_HOST", "smtp.example.com")
+    monkeypatch.setenv("CLAUDESTRUCT_EMAIL_SMTP_PORT", "587")
+    monkeypatch.setenv("CLAUDESTRUCT_EMAIL_FROM", "alerts@example.com")
+    monkeypatch.setenv(
+        "CLAUDESTRUCT_EMAIL_TO", "oncall@example.com,sre@example.com",
+    )
+    monkeypatch.setenv("CLAUDESTRUCT_EMAIL_SMTP_USERNAME", "alerts@example.com")
+    monkeypatch.setenv("CLAUDESTRUCT_EMAIL_SMTP_PASSWORD", "hunter2")
+
+    n = notify_mod.default_notifier()
+    assert n.name == "email"
+    assert n._to == ["oncall@example.com", "sre@example.com"]
+
+
+def test_default_notifier_email_missing_required_env_raises(monkeypatch):
+    monkeypatch.setenv("CLAUDESTRUCT_NOTIFY_PROVIDER", "email")
+    monkeypatch.delenv("CLAUDESTRUCT_EMAIL_SMTP_HOST", raising=False)
+    with pytest.raises(RuntimeError, match="CLAUDESTRUCT_EMAIL_SMTP_HOST"):
+        notify_mod.default_notifier()
+
+
+def test_default_notifier_email_invalid_port_raises(monkeypatch):
+    monkeypatch.setenv("CLAUDESTRUCT_NOTIFY_PROVIDER", "email")
+    monkeypatch.setenv("CLAUDESTRUCT_EMAIL_SMTP_HOST", "smtp.example.com")
+    monkeypatch.setenv("CLAUDESTRUCT_EMAIL_SMTP_PORT", "not-a-number")
+    monkeypatch.setenv("CLAUDESTRUCT_EMAIL_FROM", "alerts@example.com")
+    monkeypatch.setenv("CLAUDESTRUCT_EMAIL_TO", "oncall@example.com")
+    with pytest.raises(RuntimeError, match="not an integer"):
+        notify_mod.default_notifier()
