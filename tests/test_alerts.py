@@ -802,3 +802,208 @@ def test_run_alert_pass_helper_returns_dispatched_count(env, monkeypatch):
     n = alerts_mod.run_alert_pass(env["factory"], notifier)
     assert n == 1
     assert len(notifier.calls) == 1
+
+
+# --- Team budget-cap rollup alerts (W6.5) ---------------------------
+
+
+def _seed_team_with_spend(
+    env, *, team_slug: str, member_emails: list[str], total_spend: float,
+) -> int:
+    """Create a team in the acme org, add the listed members (creating
+    User rows as needed), and seed runs whose total cost = total_spend.
+
+    Returns the team_id."""
+    from sqlalchemy import select as _select
+
+    from claudestruct.server.models import (
+        Membership,
+        Role,
+        Team,
+        TeamMembership,
+    )
+    factory = env["factory"]
+    now = datetime(2026, 4, 28, 12, 0, tzinfo=timezone.utc)
+    with factory() as session:
+        team = Team(
+            org_id=env["acme_id"], slug=team_slug, name=team_slug.upper(),
+        )
+        session.add(team)
+        session.flush()
+
+        # Create users (and org-membership rows) for each email.
+        member_ids: list[int] = []
+        for email in member_emails:
+            existing = session.execute(
+                _select(User).where(User.email == email)
+            ).scalar_one_or_none()
+            if existing is None:
+                u = User(email=email)
+                session.add(u)
+                session.flush()
+                session.add(Membership(
+                    user_id=u.id, org_id=env["acme_id"],
+                    role=Role.member.value,
+                ))
+                member_ids.append(u.id)
+            else:
+                member_ids.append(existing.id)
+            session.add(TeamMembership(team_id=team.id, user_id=member_ids[-1]))
+
+        # Distribute spend across members so the rollup actually has
+        # to sum across user_ids (catches a "first user only" bug).
+        if member_ids and total_spend > 0:
+            per_user = total_spend / len(member_ids)
+            for i, uid in enumerate(member_ids):
+                _seed_run(
+                    session,
+                    org_id=env["acme_id"], user_id=uid,
+                    run_id=f"{team_slug}-r-{i}", cost=per_user,
+                    created_at=now - timedelta(hours=2),
+                )
+        team_id = team.id
+        session.commit()
+    return team_id
+
+
+def test_team_budget_no_findings_for_uncapped_tier(env, monkeypatch):
+    """team / business tiers have no USD cap → nothing to compare
+    against → no findings even if team has burned a lot."""
+    from claudestruct.server import billing as billing_mod
+
+    # Promote acme to team tier (uncapped).
+    factory = env["factory"]
+    with factory() as session:
+        sub = billing_mod.get_or_default(session, env["acme_id"])
+        sub.tier = billing_mod.Tier.team.value
+        session.commit()
+
+    _seed_team_with_spend(
+        env, team_slug="platform",
+        member_emails=["alice@acme"], total_spend=1000.0,
+    )
+    fake_now = datetime(2026, 4, 28, 12, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(alerts_mod, "_now_utc", lambda: fake_now)
+
+    with factory() as session:
+        findings = alerts_mod.compute_team_budget_alerts(session)
+    assert findings == []
+
+
+def test_team_budget_no_findings_below_threshold(env, monkeypatch):
+    """Free tier cap is $10; team with $5 spend (50 %) is below the
+    80 % warn threshold → no finding."""
+    _seed_team_with_spend(
+        env, team_slug="platform",
+        member_emails=["alice@acme"], total_spend=5.0,
+    )
+    fake_now = datetime(2026, 4, 28, 12, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(alerts_mod, "_now_utc", lambda: fake_now)
+    with env["factory"]() as session:
+        findings = alerts_mod.compute_team_budget_alerts(session)
+    assert findings == []
+
+
+def test_team_budget_warning_when_above_80_percent(env, monkeypatch):
+    """Free cap = $10; team has spent $8.50 (85 %) → warning."""
+    _seed_team_with_spend(
+        env, team_slug="platform",
+        member_emails=["alice@acme"], total_spend=8.50,
+    )
+    fake_now = datetime(2026, 4, 28, 12, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(alerts_mod, "_now_utc", lambda: fake_now)
+    with env["factory"]() as session:
+        findings = alerts_mod.compute_team_budget_alerts(session)
+    assert len(findings) == 1
+    f = findings[0]
+    assert f.team_slug == "platform"
+    assert f.team_cost_usd == pytest.approx(8.50)
+    assert f.org_cap_usd == pytest.approx(10.0)
+    assert f.ratio == pytest.approx(0.85)
+    alert = alerts_mod.team_budget_finding_to_alert(f)
+    assert alert.kind == "team_budget_burn"
+    assert alert.severity == "warning"
+    assert "85.0%" in alert.summary or "85%" in alert.summary
+
+
+def test_team_budget_critical_when_at_or_above_cap(env, monkeypatch):
+    """Free cap = $10; team has spent $12 (120 %) → critical."""
+    _seed_team_with_spend(
+        env, team_slug="growth",
+        member_emails=["bob@acme"], total_spend=12.0,
+    )
+    fake_now = datetime(2026, 4, 28, 12, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(alerts_mod, "_now_utc", lambda: fake_now)
+    with env["factory"]() as session:
+        findings = alerts_mod.compute_team_budget_alerts(session)
+    assert len(findings) == 1
+    alert = alerts_mod.team_budget_finding_to_alert(findings[0])
+    assert alert.severity == "critical"
+
+
+def test_team_budget_sums_across_team_members(env, monkeypatch):
+    """The rollup must sum spend across every user_id on the team —
+    a 'first user only' bug would slip through with a single-member
+    team. Two members at $4.50 each = $9 (90 %) → warning."""
+    _seed_team_with_spend(
+        env, team_slug="platform",
+        member_emails=["alice@acme", "bob@acme"], total_spend=9.0,
+    )
+    fake_now = datetime(2026, 4, 28, 12, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(alerts_mod, "_now_utc", lambda: fake_now)
+    with env["factory"]() as session:
+        findings = alerts_mod.compute_team_budget_alerts(session)
+    assert len(findings) == 1
+    assert findings[0].team_cost_usd == pytest.approx(9.0)
+    assert findings[0].ratio == pytest.approx(0.9)
+
+
+def test_team_budget_skips_empty_teams(env, monkeypatch):
+    """Team with zero TeamMembership rows → skipped, no division
+    against the cap (the spend is 0 by definition)."""
+    _seed_team_with_spend(
+        env, team_slug="empty",
+        member_emails=[], total_spend=0.0,
+    )
+    fake_now = datetime(2026, 4, 28, 12, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(alerts_mod, "_now_utc", lambda: fake_now)
+    with env["factory"]() as session:
+        findings = alerts_mod.compute_team_budget_alerts(session)
+    assert findings == []
+
+
+def test_team_budget_findings_sort_by_ratio_desc(env, monkeypatch):
+    """Operator scanning a Slack channel sees the most-burned team
+    first."""
+    _seed_team_with_spend(
+        env, team_slug="moderate",
+        member_emails=["a@acme"], total_spend=8.5,  # 85 %
+    )
+    _seed_team_with_spend(
+        env, team_slug="severe",
+        member_emails=["b@acme"], total_spend=12.0,  # 120 %
+    )
+    fake_now = datetime(2026, 4, 28, 12, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(alerts_mod, "_now_utc", lambda: fake_now)
+    with env["factory"]() as session:
+        findings = alerts_mod.compute_team_budget_alerts(session)
+    assert len(findings) == 2
+    assert findings[0].team_slug == "severe"
+    assert findings[1].team_slug == "moderate"
+
+
+def test_team_budget_findings_dispatched_through_notifier(env, monkeypatch):
+    """End-to-end: run_alert_pass dispatches BOTH cost-regression and
+    team-budget findings through a single notifier (so the same daemon
+    handles both kinds)."""
+    _seed_team_with_spend(
+        env, team_slug="platform",
+        member_emails=["alice@acme"], total_spend=9.0,  # 90 %
+    )
+    fake_now = datetime(2026, 4, 28, 12, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(alerts_mod, "_now_utc", lambda: fake_now)
+
+    notifier = _CapturingNotifier()
+    n = alerts_mod.run_alert_pass(env["factory"], notifier)
+    assert n == 1  # one team finding (the seeded data has no regression)
+    assert notifier.calls[0].kind == "team_budget_burn"
