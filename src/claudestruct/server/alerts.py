@@ -362,6 +362,160 @@ def dispatch_team_budget_findings(
     return count
 
 
+# --- SLO error-budget burn-rate alerts (A.2) ------------------------
+#
+# Multi-window burn-rate detection per the Google SRE workbook. The
+# error budget is ``1 - SUCCESS_RATE_TARGET``; the burn rate is
+# ``observed_error_rate / target_error_rate``.
+#
+# Threshold rationale:
+#   * Fast burn (≥ 14.4× over 1h) → at this rate the org would
+#     consume its entire 30-day budget in ~2 hours. Page severity.
+#   * Slow burn (≥ 6× over 6h) → 30-day budget consumed in 5 days
+#     of sustained burn. Ticket severity.
+#
+# We only emit a finding when the relevant window has ≥ 10 terminal
+# runs — under that, a single failure dominates the rate and the
+# alert just yells "100% burn" every cron tick at low traffic.
+TARGET_ERROR_RATE = 1.0 - 0.999  # mirrors SUCCESS_RATE_TARGET in slo.py
+FAST_BURN_THRESHOLD = 14.4
+SLOW_BURN_THRESHOLD = 6.0
+BURN_RATE_MIN_RUNS = 10
+
+
+@dataclass(frozen=True)
+class BurnRateFinding:
+    """One window flagged for burning the error budget too fast."""
+    org_id: int
+    org_slug: str
+    window: str  # "1h" / "6h"
+    window_seconds: int
+    total_runs: int
+    failed: int
+    error_rate: float
+    burn_rate: float        # observed / target
+    threshold: float        # FAST_BURN_THRESHOLD or SLOW_BURN_THRESHOLD
+
+
+def _compute_burn_for_window(
+    session: Session,
+    *,
+    org_id: int,
+    org_slug: str,
+    now: datetime,
+    window_seconds: int,
+    window_label: str,
+    threshold: float,
+) -> BurnRateFinding | None:
+    cutoff = now - timedelta(seconds=window_seconds)
+    rows = list(session.execute(
+        select(Run).where(
+            Run.org_id == org_id,
+            Run.status.in_((RunStatus.done.value, RunStatus.failed.value)),
+            Run.created_at >= cutoff,
+        )
+    ).scalars())
+    total = len(rows)
+    if total < BURN_RATE_MIN_RUNS:
+        return None
+    failed = sum(1 for r in rows if r.status == RunStatus.failed.value)
+    error_rate = failed / total
+    burn_rate = error_rate / TARGET_ERROR_RATE if TARGET_ERROR_RATE else 0.0
+    if burn_rate < threshold:
+        return None
+    return BurnRateFinding(
+        org_id=org_id,
+        org_slug=org_slug,
+        window=window_label,
+        window_seconds=window_seconds,
+        total_runs=total,
+        failed=failed,
+        error_rate=error_rate,
+        burn_rate=burn_rate,
+        threshold=threshold,
+    )
+
+
+def compute_burn_rate_alerts(
+    session: Session,
+    *,
+    now: datetime | None = None,
+) -> list[BurnRateFinding]:
+    """Per-org error-budget burn-rate detector.
+
+    Two windows: 1h (fast — page) and 6h (slow — ticket). An org
+    can produce findings for both windows in the same pass; the
+    notifier dedupes downstream by `(kind, org, window)` if needed.
+
+    Orgs with fewer than ``BURN_RATE_MIN_RUNS`` terminal runs in
+    the window are skipped — at low traffic the rate is dominated
+    by a single failure and the alert just yells "100% burn"
+    every cron tick.
+    """
+    n = (now or _now_utc()).astimezone(timezone.utc)
+    findings: list[BurnRateFinding] = []
+    for org in session.execute(select(Org)).scalars():
+        for label, secs, threshold in (
+            ("1h", 60 * 60, FAST_BURN_THRESHOLD),
+            ("6h", 6 * 60 * 60, SLOW_BURN_THRESHOLD),
+        ):
+            f = _compute_burn_for_window(
+                session,
+                org_id=org.id,
+                org_slug=org.slug,
+                now=n,
+                window_seconds=secs,
+                window_label=label,
+                threshold=threshold,
+            )
+            if f is not None:
+                findings.append(f)
+    # Highest burn first — operator scanning a Slack channel sees the
+    # most-on-fire org at the top.
+    findings.sort(key=lambda f: f.burn_rate, reverse=True)
+    return findings
+
+
+def burn_rate_finding_to_alert(f: BurnRateFinding) -> Alert:
+    """Translate a burn-rate finding into the wire-format ``Alert``.
+
+    Severity: ``critical`` for the 1h fast-burn window (page),
+    ``warning`` for the 6h slow-burn window (ticket).
+    """
+    severity = "critical" if f.threshold >= FAST_BURN_THRESHOLD else "warning"
+    summary = (
+        f"{f.org_slug} burning error budget at {f.burn_rate:.1f}× "
+        f"target over {f.window} ({f.failed}/{f.total_runs} failed)"
+    )
+    return Alert(
+        kind="slo_error_budget_burn",
+        severity=severity,
+        org_slug=f.org_slug,
+        summary=summary,
+        details={
+            "window": f.window,
+            "window_seconds": f.window_seconds,
+            "total_runs": f.total_runs,
+            "failed_runs": f.failed,
+            "error_rate": round(f.error_rate, 6),
+            "burn_rate": round(f.burn_rate, 3),
+            "threshold": f.threshold,
+        },
+    )
+
+
+def dispatch_burn_rate_findings(
+    findings: list[BurnRateFinding],
+    notifier: Notifier,
+) -> int:
+    """Convert burn-rate findings → Alerts and dispatch each."""
+    count = 0
+    for f in findings:
+        notifier.notify(burn_rate_finding_to_alert(f))
+        count += 1
+    return count
+
+
 def run_alert_pass(
     session_factory: Callable[[], Session],
     notifier: Notifier,
@@ -373,13 +527,14 @@ def run_alert_pass(
     """Single compute → dispatch pass. Used by both the one-shot
     `cs serve alerts` command and the long-running scheduler.
 
-    Runs both detector kinds in sequence:
+    Runs three detector kinds in sequence:
       1. Cost-regression (per-run outliers vs org baseline)
       2. Team budget-cap burn (team's share of org's monthly cap)
+      3. SLO error-budget burn-rate (Google SRE multi-window)
 
     Each pass opens its own session so we don't hold a transaction
     across the (potentially slow) network call into the notifier.
-    Returns the total number of alerts dispatched across both kinds.
+    Returns the total number of alerts dispatched across all kinds.
     """
     with session_factory() as session:
         cost_findings = compute_cost_regression_alerts(
@@ -389,8 +544,10 @@ def run_alert_pass(
             check_recent_hours=check_recent_hours,
         )
         team_findings = compute_team_budget_alerts(session)
+        burn_findings = compute_burn_rate_alerts(session)
     n = dispatch_findings(cost_findings, notifier)
     n += dispatch_team_budget_findings(team_findings, notifier)
+    n += dispatch_burn_rate_findings(burn_findings, notifier)
     return n
 
 
