@@ -60,8 +60,11 @@ nav:
       - cs serve: server.md
       - Home-server deploy: home-server.md
       - Audit log: audit.md
+      - Admin event timeline: admin-events.md
       - Billing: billing.md
       - SLO endpoint: slo.md
+      - API versioning: api-versioning.md
+      - Operator runbook: runbook.md
   - claw-squad internals:
       - Agents: claw-squad/agents.md
       - Skills: claw-squad/skills.md
