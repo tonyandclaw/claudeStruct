@@ -1,0 +1,75 @@
+version: 2
+
+# Group most updates into a single weekly PR per ecosystem so we
+# don't drown in low-signal bumps. Security patches still ship as
+# their own PR (the default open-immediately behaviour) so they
+# don't queue behind a pending weekly review.
+
+updates:
+  # Python (root project).
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "07:00"
+    open-pull-requests-limit: 5
+    groups:
+      python-deps:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+  # Python (SDK skeleton — kept on its own schedule because the SDK
+  # ships its own version + has only one runtime dep).
+  - package-ecosystem: "pip"
+    directory: "/sdks/python"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 3
+
+  # TypeScript orchestrator (claw-squad).
+  - package-ecosystem: "npm"
+    directory: "/claw-squad"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    groups:
+      ts-deps:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+      ts-types:
+        patterns: ["@types/*"]
+
+  # TypeScript SDK skeleton.
+  - package-ecosystem: "npm"
+    directory: "/sdks/typescript"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 3
+
+  # Go module (claw-sandbox).
+  - package-ecosystem: "gomod"
+    directory: "/claw-sandbox"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 3
+
+  # GitHub Actions (workflow YAML files).
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+
+  # Docker base images.
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 3
