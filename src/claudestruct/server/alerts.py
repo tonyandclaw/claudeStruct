@@ -31,10 +31,10 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from claudestruct.server.models import Org, Run, RunStatus
+from claudestruct.server.models import Org, Run, RunStatus, Team, TeamMembership
 from claudestruct.server.notify import Alert, Notifier
 
 log = logging.getLogger("claudestruct.alerts")
@@ -43,6 +43,12 @@ DEFAULT_SIGMA = 2.0
 DEFAULT_LOOKBACK_DAYS = 30
 DEFAULT_CHECK_RECENT_HOURS = 24
 MIN_BASELINE_RUNS = 3
+
+# Thresholds for the team-budget burn alert (W6.5 follow-up). Match
+# the existing severity ladder used by `finding_to_alert`: warning
+# under cap, critical at/over.
+TEAM_BUDGET_WARN_RATIO = 0.8
+TEAM_BUDGET_CRIT_RATIO = 1.0
 
 
 def _now_utc() -> datetime:
@@ -213,6 +219,149 @@ def dispatch_findings(
     return count
 
 
+# --- Team budget-cap rollup alerts (W6.5 follow-up) ----------------
+
+
+@dataclass(frozen=True)
+class TeamBudgetFinding:
+    """One team flagged for having burned ≥ ``TEAM_BUDGET_WARN_RATIO``
+    of the org's monthly USD cap. Rolled up over the org's current
+    Stripe billing period (or UTC calendar month if Stripe state is
+    absent).
+
+    ``ratio`` = ``team_cost_usd`` / ``org_cap_usd``. ≥ 1.0 means the
+    team alone has already met or exceeded the org's cap — at that
+    point the org is presumably either over-budget or unable to
+    submit new runs (whichever the W8.2 enforcement path decided).
+    """
+    org_id: int
+    org_slug: str
+    team_id: int
+    team_slug: str
+    team_cost_usd: float
+    org_cap_usd: float
+    ratio: float
+    period_start: datetime
+    period_end: datetime
+
+
+def compute_team_budget_alerts(
+    session: Session,
+    *,
+    now: datetime | None = None,
+) -> list[TeamBudgetFinding]:
+    """Roll up per-team spend in the current billing period and flag
+    teams that have burned ≥ 80 % of the org's tier USD cap.
+
+    Uncapped tiers (team / business have ``TIER_USD_CAPS = None``)
+    are skipped — there's no fixed denominator to compare against.
+
+    Empty teams (no ``team_memberships`` rows) are skipped — they can
+    have no spend by definition; emitting a 0 / cap row would be noise.
+    """
+    # Local import to dodge a circular: billing -> alerts (via cli) -> billing.
+    from claudestruct.server.billing import (
+        current_period_bounds,
+        get_or_default,
+        tier_usd_cap,
+    )
+
+    n = (now or _now_utc()).astimezone(timezone.utc)
+    findings: list[TeamBudgetFinding] = []
+
+    for org in session.execute(select(Org)).scalars():
+        sub = get_or_default(session, org.id)
+        cap = tier_usd_cap(sub.tier)
+        if cap is None or cap <= 0:
+            continue  # uncapped tier, or 0-cap which we'd divide by below
+        period_start, period_end = current_period_bounds(sub, now=n)
+        teams = list(session.execute(
+            select(Team).where(Team.org_id == org.id)
+        ).scalars())
+        if not teams:
+            continue
+        for team in teams:
+            user_ids = {
+                m.user_id for m in session.execute(
+                    select(TeamMembership).where(
+                        TeamMembership.team_id == team.id
+                    )
+                ).scalars()
+            }
+            if not user_ids:
+                continue
+            team_cost = float(session.execute(
+                select(func.coalesce(func.sum(Run.cost_usd), 0.0)).where(
+                    Run.org_id == org.id,
+                    Run.user_id.in_(user_ids),
+                    Run.created_at >= period_start,
+                    Run.created_at < period_end,
+                )
+            ).scalar() or 0.0)
+            ratio = team_cost / cap
+            if ratio < TEAM_BUDGET_WARN_RATIO:
+                continue
+            findings.append(TeamBudgetFinding(
+                org_id=org.id,
+                org_slug=org.slug,
+                team_id=team.id,
+                team_slug=team.slug,
+                team_cost_usd=team_cost,
+                org_cap_usd=cap,
+                ratio=ratio,
+                period_start=period_start,
+                period_end=period_end,
+            ))
+    # Highest ratio first — operator scanning a Slack channel sees
+    # the most-over-budget team at the top.
+    findings.sort(key=lambda f: f.ratio, reverse=True)
+    return findings
+
+
+def team_budget_finding_to_alert(f: TeamBudgetFinding) -> Alert:
+    """Translate a team-budget finding into the wire-format Alert.
+
+    Severity ladder mirrors `finding_to_alert`:
+      * ratio ≥ 1.0 → critical (team alone has met or exceeded the
+        org's monthly cap)
+      * 0.8 ≤ ratio < 1.0 → warning
+      * below 0.8 we don't emit a finding at all, so info-tier is
+        unused here.
+    """
+    severity = "critical" if f.ratio >= TEAM_BUDGET_CRIT_RATIO else "warning"
+    pct = round(f.ratio * 100, 1)
+    summary = (
+        f"team {f.team_slug} has burned {pct}% of {f.org_slug}'s "
+        f"monthly cap (${f.team_cost_usd:.2f} / ${f.org_cap_usd:.2f})"
+    )
+    return Alert(
+        kind="team_budget_burn",
+        severity=severity,
+        org_slug=f.org_slug,
+        summary=summary,
+        details={
+            "team_slug": f.team_slug,
+            "team_cost_usd": round(f.team_cost_usd, 6),
+            "org_cap_usd": round(f.org_cap_usd, 6),
+            "ratio": round(f.ratio, 3),
+            "period_start": f.period_start.isoformat(),
+            "period_end": f.period_end.isoformat(),
+        },
+    )
+
+
+def dispatch_team_budget_findings(
+    findings: list[TeamBudgetFinding],
+    notifier: Notifier,
+) -> int:
+    """Convert team-budget findings → Alerts and dispatch each."""
+    count = 0
+    for f in findings:
+        notifier.notify(team_budget_finding_to_alert(f))
+        count += 1
+    return count
+
+
 def run_alert_pass(
     session_factory: Callable[[], Session],
     notifier: Notifier,
@@ -224,17 +373,25 @@ def run_alert_pass(
     """Single compute → dispatch pass. Used by both the one-shot
     `cs serve alerts` command and the long-running scheduler.
 
+    Runs both detector kinds in sequence:
+      1. Cost-regression (per-run outliers vs org baseline)
+      2. Team budget-cap burn (team's share of org's monthly cap)
+
     Each pass opens its own session so we don't hold a transaction
     across the (potentially slow) network call into the notifier.
+    Returns the total number of alerts dispatched across both kinds.
     """
     with session_factory() as session:
-        findings = compute_cost_regression_alerts(
+        cost_findings = compute_cost_regression_alerts(
             session,
             sigma=sigma,
             lookback_days=lookback_days,
             check_recent_hours=check_recent_hours,
         )
-    return dispatch_findings(findings, notifier)
+        team_findings = compute_team_budget_alerts(session)
+    n = dispatch_findings(cost_findings, notifier)
+    n += dispatch_team_budget_findings(team_findings, notifier)
+    return n
 
 
 class AlertsScheduler:
