@@ -92,21 +92,27 @@ def test_versions_directory_exists():
 
 
 def test_baseline_migration_is_present(script):
-    """The seeded baseline migration is the one and only head."""
+    """At least one migration exists. As the schema evolves we'll
+    accumulate more migrations on top, so this test only asserts a
+    non-empty chain rather than counting heads."""
     heads = script.get_heads()
     assert len(heads) == 1, (
-        f"Expected exactly one head revision (the baseline); "
-        f"found {len(heads)}: {heads}"
+        f"Expected exactly one head revision; found {len(heads)}: {heads}"
     )
 
 
-def test_baseline_migration_has_no_parent(script):
-    """The baseline migration is the chain root (down_revision is None)."""
+def test_chain_has_a_root_revision(script):
+    """Walking from head to base must reach a revision with
+    `down_revision=None` — i.e. a real chain root, not a dangling
+    branch. `alembic upgrade head` on a fresh DB only succeeds when
+    the chain has a root."""
     head_id = script.get_heads()[0]
-    head_rev = script.get_revision(head_id)
-    assert head_rev.down_revision is None, (
-        "Baseline migration must have down_revision=None so "
-        "`alembic upgrade head` works on a fresh DB."
+    revs = list(script.walk_revisions(base="base", head=head_id))
+    assert revs, "no revisions in the chain"
+    root = revs[-1]
+    assert root.down_revision is None, (
+        f"Chain root {root.revision!r} has down_revision="
+        f"{root.down_revision!r}; expected None."
     )
 
 

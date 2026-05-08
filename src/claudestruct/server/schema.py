@@ -190,7 +190,11 @@ class CreateRunRequest(BaseModel):
 
 class CreateRunResponse(BaseModel):
     run_id: str
-    status: Literal["queued"]
+    # `queued` for new submissions. For idempotent replays the run
+    # might be in any of the lifecycle states by the time the
+    # second request arrives — `running` / `done` / `failed` — so
+    # the response carries the live status rather than lying.
+    status: Literal["queued", "running", "done", "failed"] = "queued"
     note: str = (
         "Run is queued. The daemon-mode worker (W6.1) picks it up and "
         "writes results back to the same row; poll GET /v1/runs/{id} "

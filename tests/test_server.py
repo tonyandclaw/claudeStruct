@@ -391,6 +391,137 @@ def test_run_isolation_across_orgs(env):
     assert g.status_code == 404
 
 
+# --- Idempotency-Key on POST /v1/runs --------------------------------
+
+def test_post_run_with_idempotency_key_persists_key(env):
+    """The submitted Idempotency-Key lands on the Run row so we can
+    look it up on a retry."""
+    from sqlalchemy import select
+
+    from claudestruct.server.models import Run
+
+    r = env["client"].post(
+        "/v1/runs",
+        json={"task": "dev", "description": "x"},
+        headers={
+            **_auth(env["keys"]["member@a"]),
+            "Idempotency-Key": "abc-123",
+        },
+    )
+    assert r.status_code == 202
+    run_id = r.json()["run_id"]
+    with env["factory"]() as session:
+        row = session.execute(
+            select(Run).where(Run.run_id == run_id)
+        ).scalar_one()
+        assert row.idempotency_key == "abc-123"
+
+
+def test_post_run_idempotent_replay_returns_original_run(env):
+    """Same `(org, key)` on a second submit returns the original
+    run_id and notes 'idempotent replay' — does NOT create a new
+    Run row."""
+    from sqlalchemy import select
+
+    from claudestruct.server.models import Run
+
+    headers = {
+        **_auth(env["keys"]["member@a"]),
+        "Idempotency-Key": "stable-key",
+    }
+    body = {"task": "dev", "description": "x"}
+
+    first = env["client"].post("/v1/runs", json=body, headers=headers)
+    assert first.status_code == 202
+    first_id = first.json()["run_id"]
+
+    second = env["client"].post("/v1/runs", json=body, headers=headers)
+    assert second.status_code == 202
+    second_body = second.json()
+    assert second_body["run_id"] == first_id
+    assert second_body["note"] == "idempotent replay"
+
+    with env["factory"]() as session:
+        rows = session.execute(
+            select(Run).where(Run.idempotency_key == "stable-key")
+        ).scalars().all()
+    assert len(rows) == 1
+
+
+def test_post_run_idempotent_replay_returns_live_status(env):
+    """The replayed response carries the run's *current* status —
+    not a stale 'queued' — so the caller learns the run already
+    finished if the worker was fast."""
+    from sqlalchemy import select
+
+    from claudestruct.server.models import Run, RunStatus
+
+    headers = {
+        **_auth(env["keys"]["member@a"]),
+        "Idempotency-Key": "fast-key",
+    }
+    first = env["client"].post(
+        "/v1/runs", json={"task": "dev", "description": "x"}, headers=headers,
+    )
+    run_id = first.json()["run_id"]
+    # Mutate the row to simulate the worker having finished it.
+    with env["factory"]() as session:
+        row = session.execute(
+            select(Run).where(Run.run_id == run_id)
+        ).scalar_one()
+        row.status = RunStatus.done.value
+        session.commit()
+
+    second = env["client"].post(
+        "/v1/runs", json={"task": "dev", "description": "x"}, headers=headers,
+    )
+    assert second.json()["status"] == "done"
+
+
+def test_post_run_idempotency_key_scoped_per_org(env):
+    """Same key in different orgs creates two distinct runs — the
+    UNIQUE constraint is `(org_id, idempotency_key)`, not just
+    `idempotency_key`."""
+    headers_a = {
+        **_auth(env["keys"]["member@a"]),
+        "Idempotency-Key": "shared-key",
+    }
+    headers_b = {
+        **_auth(env["keys"]["admin@b"]),
+        "Idempotency-Key": "shared-key",
+    }
+    body = {"task": "dev", "description": "x"}
+
+    r1 = env["client"].post("/v1/runs", json=body, headers=headers_a)
+    r2 = env["client"].post("/v1/runs", json=body, headers=headers_b)
+    assert r1.status_code == 202
+    assert r2.status_code == 202
+    assert r1.json()["run_id"] != r2.json()["run_id"]
+
+
+def test_post_run_empty_idempotency_key_treated_as_absent(env):
+    """A whitespace-only `Idempotency-Key` header must NOT collide
+    every run with the empty string. Two submits with empty keys
+    create two distinct runs."""
+    headers = {
+        **_auth(env["keys"]["member@a"]),
+        "Idempotency-Key": "   ",
+    }
+    body = {"task": "dev", "description": "x"}
+    r1 = env["client"].post("/v1/runs", json=body, headers=headers)
+    r2 = env["client"].post("/v1/runs", json=body, headers=headers)
+    assert r1.json()["run_id"] != r2.json()["run_id"]
+
+
+def test_post_run_no_idempotency_header_creates_each_time(env):
+    """Without the header, every submit gets a fresh run."""
+    headers = _auth(env["keys"]["member@a"])
+    body = {"task": "dev", "description": "x"}
+    r1 = env["client"].post("/v1/runs", json=body, headers=headers)
+    r2 = env["client"].post("/v1/runs", json=body, headers=headers)
+    assert r1.json()["run_id"] != r2.json()["run_id"]
+
+
 def test_drain_queue_processes_all_pending(env):
     from claudestruct.server.worker import drain_queue
 
