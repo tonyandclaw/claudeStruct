@@ -83,6 +83,29 @@ class RegionHeaderMiddleware(BaseHTTPMiddleware):
         return response
 
 
+# A.4 — API version + deprecation policy. Routes already live under
+# ``/v1/...``; the header is the second proof so a client built
+# against the docs can sanity-check that they're talking to the
+# version they expect (catches a misconfigured proxy that stripped
+# the path prefix). Bumps to ``v2`` when the next major contract
+# lands; ``v1`` will then carry ``Sunset:`` per docs/api-versioning.md.
+API_VERSION = "v1"
+
+
+class ApiVersionHeaderMiddleware(BaseHTTPMiddleware):
+    """Stamp every response with ``X-CS-Api-Version`` so clients can
+    detect a version mismatch without parsing the URL."""
+
+    def __init__(self, app: Any, version: str) -> None:
+        super().__init__(app)
+        self.version = version
+
+    async def dispatch(self, request: Request, call_next):  # noqa: D401
+        response = await call_next(request)
+        response.headers["X-CS-Api-Version"] = self.version
+        return response
+
+
 def create_app(
     *,
     db_url: str | None = None,
@@ -128,6 +151,7 @@ def create_app(
     app.state.latency_tracker = LatencyTracker()
     app.add_middleware(RequestLatencyMiddleware, tracker=app.state.latency_tracker)
     app.add_middleware(RegionHeaderMiddleware, region=app.state.region)
+    app.add_middleware(ApiVersionHeaderMiddleware, version=API_VERSION)
 
     app.include_router(health_router.router)
     app.include_router(keys_router.router)
