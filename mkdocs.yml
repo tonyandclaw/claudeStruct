@@ -63,6 +63,7 @@ nav:
       - Admin event timeline: admin-events.md
       - Billing: billing.md
       - SLO endpoint: slo.md
+      - Status page: status.md
       - API versioning: api-versioning.md
       - Operator runbook: runbook.md
   - claw-squad internals:
