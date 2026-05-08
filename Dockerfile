@@ -7,7 +7,7 @@
 # (or `claw-sandbox`) to run the other binaries.
 
 # --- Stage 1: build claw-sandbox (Go) -------------------------------
-FROM golang:1.22-alpine AS go-builder
+FROM golang:1.26-alpine AS go-builder
 WORKDIR /src
 COPY claw-sandbox/ ./
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/claw-sandbox .
