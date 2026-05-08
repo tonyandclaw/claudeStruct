@@ -40,6 +40,7 @@ from fastapi import APIRouter, HTTPException, Request, Response, status
 from fastapi.responses import RedirectResponse
 from sqlalchemy import select
 
+from claudestruct.server import audit as audit_mod
 from claudestruct.server import oauth as oauth_mod
 from claudestruct.server.models import Membership, Org, User, UserSession
 
@@ -155,6 +156,20 @@ def github_callback(
             expires_at=oauth_mod.session_expiry(),
         )
         session.add(sess_row)
+        session.flush()
+        # Audit the login (A.5 customer-success instrumentation).
+        # The session token itself is sensitive — record only the
+        # provider + the row id so a support-ticket walk can correlate
+        # without exposing the cookie value.
+        audit_mod.record(
+            session,
+            org_id=membership.org_id,
+            actor_user_id=user.id,
+            action="auth.login.success",
+            resource_type="user_session",
+            resource_id=str(sess_row.id),
+            payload={"provider": "github"},
+        )
         session.commit()
 
     # Redirect back to a generic "/" — the SPA mounted there reads
@@ -236,6 +251,19 @@ def logout(request: Request, response: Response) -> dict[str, str]:
             ).scalar_one_or_none()
             if sess is not None and sess.revoked_at is None:
                 sess.revoked_at = datetime.now(timezone.utc)
+                # Audit the logout (A.5). The cookie value itself is
+                # not recorded — only the session row id — so the
+                # audit trail can be correlated by support without
+                # leaking the bearer.
+                audit_mod.record(
+                    session,
+                    org_id=sess.org_id,
+                    actor_user_id=sess.user_id,
+                    action="auth.logout",
+                    resource_type="user_session",
+                    resource_id=str(sess.id),
+                    payload={"provider": sess.provider},
+                )
                 session.commit()
     response.delete_cookie(SESSION_COOKIE_NAME, path="/")
     return {"status": "logged_out"}

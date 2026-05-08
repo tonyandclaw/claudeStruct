@@ -33,6 +33,7 @@ from fastapi import APIRouter, Header, HTTPException, Request, status
 from sqlalchemy import select
 
 from claudestruct.server.models import GitHubInstallation, Run, RunStatus
+from claudestruct.server.webhook_metrics import WEBHOOK_ERRORS
 
 router = APIRouter(prefix="/v1/github", tags=["github"])
 log = logging.getLogger("claudestruct.server.github")
@@ -118,9 +119,15 @@ def _post_ack_comment_safe(
         )
         log.info("github ack comment posted: %s", url)
     except GitHubAppError as exc:
+        WEBHOOK_ERRORS.bump(
+            path="github.ack_comment", reason="github_app_error",
+        )
         log.warning("github ack comment failed: %s", exc)
     except Exception:  # noqa: BLE001
         # Network / unexpected errors — log loudly but do not raise.
+        WEBHOOK_ERRORS.bump(
+            path="github.ack_comment", reason="unexpected",
+        )
         log.exception("github ack comment unexpected failure")
     finally:
         close = getattr(client, "close", None)

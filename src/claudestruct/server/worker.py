@@ -50,6 +50,7 @@ from claudestruct.context import (
 from claudestruct.runner import run_task_and_log
 from claudestruct.server import billing as billing_mod
 from claudestruct.server.models import Run, RunStatus
+from claudestruct.server.webhook_metrics import WEBHOOK_ERRORS
 
 log = logging.getLogger("claudestruct.server.worker")
 
@@ -129,8 +130,14 @@ def _post_verdict_comment_safe(run: Run) -> None:
         )
         log.info("github verdict comment posted for run %s: %s", run.run_id, url)
     except GitHubAppError as exc:
+        WEBHOOK_ERRORS.bump(
+            path="github.verdict_comment", reason="github_app_error",
+        )
         log.warning("github verdict comment failed for run %s: %s", run.run_id, exc)
     except Exception:  # noqa: BLE001
+        WEBHOOK_ERRORS.bump(
+            path="github.verdict_comment", reason="unexpected",
+        )
         log.exception("github verdict comment unexpected failure for run %s", run.run_id)
     finally:
         close = getattr(client, "close", None)
@@ -194,8 +201,14 @@ def _post_in_progress_check_run_safe(session: Session, run: Run) -> None:
             run.run_id, run.github_check_run_id,
         )
     except GitHubAppError as exc:
+        WEBHOOK_ERRORS.bump(
+            path="github.check_run_open", reason="github_app_error",
+        )
         log.warning("github check_run open failed for run %s: %s", run.run_id, exc)
     except Exception:  # noqa: BLE001
+        WEBHOOK_ERRORS.bump(
+            path="github.check_run_open", reason="unexpected",
+        )
         log.exception("github check_run open unexpected failure for run %s", run.run_id)
     finally:
         close = getattr(client, "close", None)
@@ -265,8 +278,14 @@ def _post_completed_check_run_safe(run: Run) -> None:
             )
             log.info("github check_run created (no open) for run %s", run.run_id)
     except GitHubAppError as exc:
+        WEBHOOK_ERRORS.bump(
+            path="github.check_run_complete", reason="github_app_error",
+        )
         log.warning("github check_run completion failed for run %s: %s", run.run_id, exc)
     except Exception:  # noqa: BLE001
+        WEBHOOK_ERRORS.bump(
+            path="github.check_run_complete", reason="unexpected",
+        )
         log.exception("github check_run completion unexpected failure for run %s", run.run_id)
     finally:
         close = getattr(client, "close", None)
@@ -323,8 +342,14 @@ def _open_pr_as_bot_safe(session: Session, run: Run, run_root: Path) -> None:
             run.run_id, run.github_pr_number,
         )
     except GitHubAppError as exc:
+        WEBHOOK_ERRORS.bump(
+            path="github.pr_open", reason="github_app_error",
+        )
         log.warning("github PR-open failed for run %s: %s", run.run_id, exc)
     except Exception:  # noqa: BLE001
+        WEBHOOK_ERRORS.bump(
+            path="github.pr_open", reason="unexpected",
+        )
         log.exception("github PR-open unexpected failure for run %s", run.run_id)
     finally:
         close = getattr(client, "close", None)

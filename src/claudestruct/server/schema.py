@@ -20,6 +20,41 @@ class HealthResponse(BaseModel):
     region: Optional[str] = None
 
 
+# --- Public status page (A.6) --------------------------------------
+
+
+class ComponentStatus(BaseModel):
+    """Health summary for one named subsystem.
+
+    `state` is one of: ``ok`` | ``degraded`` | ``down``. Status pages
+    typically render these as green / amber / red. ``detail`` is a
+    short human-readable string the public can read without needing
+    to know the internals.
+    """
+    name: str
+    state: Literal["ok", "degraded", "down"]
+    detail: Optional[str] = None
+
+
+class StatusResponse(BaseModel):
+    """Read-only public status snapshot.
+
+    Aggregates ``/healthz`` + DB connectivity + worker queue depth
+    + last successful run + recent fleet error rate. No tenant data
+    leaks: every field is either a global aggregate or a static
+    deployment fact (version, region).
+    """
+    version: str
+    region: Optional[str] = None
+    overall: Literal["ok", "degraded", "down"]
+    components: list[ComponentStatus]
+    # Aggregates — same fleet-wide shape as `/v1/slo`, no per-org keys.
+    queue_depth: int
+    last_successful_run_at: Optional[datetime] = None
+    recent_error_rate_1h: Optional[float] = None
+    generated_at: datetime
+
+
 # --- Auth / keys ----------------------------------------------------
 
 class CreateKeyRequest(BaseModel):
@@ -155,7 +190,11 @@ class CreateRunRequest(BaseModel):
 
 class CreateRunResponse(BaseModel):
     run_id: str
-    status: Literal["queued"]
+    # `queued` for new submissions. For idempotent replays the run
+    # might be in any of the lifecycle states by the time the
+    # second request arrives — `running` / `done` / `failed` — so
+    # the response carries the live status rather than lying.
+    status: Literal["queued", "running", "done", "failed"] = "queued"
     note: str = (
         "Run is queued. The daemon-mode worker (W6.1) picks it up and "
         "writes results back to the same row; poll GET /v1/runs/{id} "
@@ -182,6 +221,19 @@ class TokenCapExceededResponse(BaseModel):
 
 class RunDetail(RunRow):
     pass
+
+
+class RunListResponse(BaseModel):
+    """Tenant-scoped page of runs from `GET /v1/runs`.
+
+    Cursor pagination: callers pass back `next_cursor` from the
+    previous page to fetch older rows. `next_cursor` is `None` when
+    the server has returned the last page. The cursor is opaque —
+    its encoding (currently base64 of ``<created_at_iso>|<id>``) may
+    change without a contract bump.
+    """
+    runs: list[RunRow]
+    next_cursor: Optional[str] = None
 
 
 # --- Audit log (W8.4) ----------------------------------------------

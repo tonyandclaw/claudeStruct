@@ -224,3 +224,66 @@ def require_role(min_role: Role):
         return principal
 
     return _dep
+
+
+# --- Tenant-isolation helpers (C.5) --------------------------------
+#
+# Every multi-tenant query in this codebase has an `org_id` filter
+# attached manually. The helpers below give the filter a name and a
+# single import site, so:
+#
+#   1. A future router that forgets to filter is a single missing
+#      import (review-catchable) instead of a missing `.where(...)`
+#      buried in a chained query.
+#   2. Cross-tenant fetches return 404 (not 403) consistently —
+#      the no-leakage rule lives in one place.
+#
+# Both helpers expect the model to expose `.org_id`. They don't try
+# to be generic over arbitrary ownership fields; that would invite
+# the misuse "I'll just pass `user_id` here instead" which silently
+# breaks org-scoped sharing.
+
+
+def with_org_scope(stmt, model, principal: Principal):
+    """Add ``.where(model.org_id == principal.org_id)`` to a SELECT.
+
+    Use as the LAST step before ``session.execute(...)`` so the
+    filter is the visibly-final constraint, not buried under a
+    cascade of optional `.where(...)` calls. Returns the modified
+    statement so this composes with the SQLAlchemy fluent API.
+    """
+    return stmt.where(model.org_id == principal.org_id)
+
+
+def require_org_owned(row, principal: Principal, *, label: str = "resource"):
+    """Raise ``HTTPException(404)`` if ``row`` is None or doesn't
+    belong to the principal's org.
+
+    Use at the point of fetch — typically right after a
+    ``session.get(Model, id)`` or a query that filtered by id but
+    not (yet) by org. The 404 is intentional even for a
+    cross-tenant hit: a 403 would tell the attacker the id exists
+    in *some* org, which is a low-key enumeration oracle.
+
+    `label` is the noun used in the error detail (``"key"``,
+    ``"team"``, ``"invoice"``); kept generic so the same helper
+    works across all routers.
+    """
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"{label} not found")
+    row_org_id = getattr(row, "org_id", None)
+    if row_org_id is None:
+        # The row's model doesn't expose `org_id` — by the rule in
+        # the module docstring, this helper is misapplied. Loud
+        # failure rather than silent pass: a model without `org_id`
+        # is by definition not tenant-scoped, and the caller should
+        # use a different gate.
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"{type(row).__name__} has no org_id; require_org_owned "
+                f"must only be used on tenant-scoped models"
+            ),
+        )
+    if row_org_id != principal.org_id:
+        raise HTTPException(status_code=404, detail=f"{label} not found")

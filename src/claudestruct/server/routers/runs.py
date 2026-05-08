@@ -4,15 +4,25 @@
 ``server/worker.py``) picks it up. ``GET /v1/runs/{id}`` reads the
 DB first, falling back to the JSONL log so historical runs (created
 before W6.1 landed) remain accessible.
+
+Optional ``Idempotency-Key`` header on POST: a client can resubmit
+a request safely (e.g. after a network blip) by sending the same
+opaque string a second time — we'll return the *original* run's
+response without creating a duplicate. Scoped per-org via the
+``(org_id, idempotency_key)`` UNIQUE constraint on the Run table.
 """
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import secrets
+from datetime import datetime
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from claudestruct import dashboard as dash_mod
@@ -24,6 +34,8 @@ from claudestruct.server.schema import (
     CreateRunRequest,
     CreateRunResponse,
     RunDetail,
+    RunListResponse,
+    RunRow,
     TokenCapExceededResponse,
 )
 
@@ -72,6 +84,7 @@ def _enforce_token_cap(session: Session, *, org_id: int) -> None:
 )
 def create_run(
     body: CreateRunRequest,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     principal: auth_mod.Principal = Depends(auth_mod.require_role(Role.member)),
     session: Session = Depends(auth_mod.get_session),
 ) -> CreateRunResponse:
@@ -87,8 +100,42 @@ def create_run(
     already burned its monthly token cap. The 402 body lists usage,
     cap, period_end, and tier so the SPA / CLI can render a single
     actionable upgrade prompt without a follow-up call.
+
+    Idempotency: optional ``Idempotency-Key`` request header. When
+    set, a second submit with the same `(org_id, key)` returns the
+    original run's identifier instead of creating a duplicate — the
+    standard pattern for safely retrying after a network blip. Scoped
+    per-org via the UNIQUE constraint on `Run.idempotency_key`.
     """
     _enforce_token_cap(session, org_id=principal.org_id)
+
+    # If the caller supplied an idempotency key, look up an existing
+    # submission BEFORE writing a new row. Empty / whitespace-only
+    # keys are treated as absent so a client can't accidentally
+    # collide every run with the empty string. Both the lookup and
+    # the row write use the same normalised value (None for empty)
+    # so the UNIQUE constraint never sees an empty string.
+    idem = idempotency_key.strip() if idempotency_key else None
+    if idem == "":
+        idem = None
+    if idem:
+        existing = session.execute(
+            select(Run).where(
+                Run.org_id == principal.org_id,
+                Run.idempotency_key == idem,
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            # Replay the original response. Status reflects current
+            # state (the worker may have already moved it forward),
+            # so the caller gets useful information rather than a
+            # stale "queued".
+            return CreateRunResponse(
+                run_id=existing.run_id,
+                status=existing.status,
+                note="idempotent replay",
+            )
+
     # 8 hex bytes → 16 chars; collision-resistant within the per-org
     # key space and short enough for log lines / URL paths.
     run_id = f"run-{secrets.token_hex(8)}"
@@ -102,9 +149,30 @@ def create_run(
         model=body.model,
         effort=body.effort,
         paths_json=json.dumps(body.paths) if body.paths else None,
+        idempotency_key=idem,
     )
     session.add(row)
-    session.flush()
+    try:
+        session.flush()
+    except IntegrityError:
+        # Race: another concurrent request inserted the same
+        # (org_id, idempotency_key) between our SELECT above and
+        # this INSERT. Roll back, re-fetch, and replay the original.
+        session.rollback()
+        if idem:
+            existing = session.execute(
+                select(Run).where(
+                    Run.org_id == principal.org_id,
+                    Run.idempotency_key == idem,
+                )
+            ).scalar_one_or_none()
+            if existing is not None:
+                return CreateRunResponse(
+                    run_id=existing.run_id,
+                    status=existing.status,
+                    note="idempotent replay (race)",
+                )
+        raise
     audit_mod.record(
         session,
         org_id=principal.org_id,
@@ -124,9 +192,10 @@ def create_run(
     return CreateRunResponse(run_id=run_id, status="queued")
 
 
-def _row_to_detail(run: Run) -> RunDetail:
-    """Translate a DB Run row into the public RunDetail shape."""
-    return RunDetail(
+def _row_to_row(run: Run) -> RunRow:
+    """Translate a DB Run row into the dashboard's RunRow shape (shared
+    with `_row_to_detail` — RunDetail is currently a RunRow alias)."""
+    return RunRow(
         run_id=run.run_id,
         started_at=run.started_at.isoformat() if run.started_at else None,
         ended_at=run.ended_at.isoformat() if run.ended_at else None,
@@ -142,6 +211,117 @@ def _row_to_detail(run: Run) -> RunDetail:
         cost_usd=round(run.cost_usd, 6),
         cache_warnings=[run.error] if run.error else [],
     )
+
+
+# Cursor format: base64(`<created_at_iso>|<id>`). The `id` tie-breaker
+# is required because two rows can share `created_at` to the
+# microsecond on busy clusters; without it, pagination can either
+# skip rows or loop. Opaque so we can swap encodings without a
+# client-visible contract bump.
+def _encode_cursor(created_at: datetime, row_id: int) -> str:
+    raw = f"{created_at.isoformat()}|{row_id}".encode()
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def _decode_cursor(cursor: str) -> tuple[datetime, int]:
+    pad = "=" * (-len(cursor) % 4)
+    try:
+        raw = base64.urlsafe_b64decode(cursor + pad).decode()
+        ts_str, id_str = raw.rsplit("|", 1)
+        return datetime.fromisoformat(ts_str), int(id_str)
+    except (ValueError, UnicodeDecodeError, binascii.Error) as exc:
+        raise HTTPException(
+            status_code=400, detail=f"invalid cursor: {exc}",
+        ) from exc
+
+
+@router.get("", response_model=RunListResponse)
+def list_runs(
+    request: Request,
+    limit: int = Query(default=50, ge=1, le=200),
+    cursor: str | None = Query(default=None),
+    status_filter: str | None = Query(default=None, alias="status"),
+    task: str | None = Query(default=None),
+    principal: auth_mod.Principal = Depends(auth_mod.require_role(Role.viewer)),
+) -> RunListResponse:
+    """Tenant-scoped list of runs, newest first.
+
+    Pagination is cursor-based: the response carries `next_cursor`
+    when more rows exist; the caller passes it back unchanged on the
+    next request. We deliberately do not use offsets — an offset is
+    O(N) at the DB and silently skips rows when new ones land between
+    requests.
+
+    Filters are AND-combined:
+      - `status` — `queued`, `running`, `done`, or `failed`. Unknown
+        values 400 instead of returning the empty set, so a typo
+        surfaces immediately.
+      - `task` — `dev`, `review`, `plan`, `debug`. Same shape.
+
+    Tenant isolation: the `Run.org_id == principal.org_id` filter is
+    unconditional. The endpoint can never surface another org's runs
+    even if the caller crafts a cursor pointing at one — the cursor
+    is just an ordering anchor, not a bypass.
+    """
+    if status_filter is not None and status_filter not in {
+        s.value for s in RunStatus
+    }:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "invalid status; must be one of: "
+                f"{sorted(s.value for s in RunStatus)}"
+            ),
+        )
+    valid_tasks = {"dev", "review", "plan", "debug"}
+    if task is not None and task not in valid_tasks:
+        raise HTTPException(
+            status_code=400,
+            detail=f"invalid task; must be one of: {sorted(valid_tasks)}",
+        )
+
+    factory = request.app.state.session_factory
+    with factory() as session:
+        query = select(Run).where(Run.org_id == principal.org_id)
+        if status_filter is not None:
+            query = query.where(Run.status == status_filter)
+        if task is not None:
+            query = query.where(Run.task == task)
+        if cursor is not None:
+            cur_ts, cur_id = _decode_cursor(cursor)
+            # `(created_at, id) < (cur_ts, cur_id)` in lexical order =
+            # "strictly older than the last row of the previous page".
+            # Composed via OR rather than a row-value comparison so
+            # SQLite can use the (created_at, id) index path.
+            query = query.where(
+                (Run.created_at < cur_ts)
+                | ((Run.created_at == cur_ts) & (Run.id < cur_id))
+            )
+        # Fetch one extra so we know whether to emit a next_cursor
+        # without a separate COUNT(*) query.
+        rows = list(session.execute(
+            query.order_by(Run.created_at.desc(), Run.id.desc()).limit(limit + 1)
+        ).scalars())
+        has_more = len(rows) > limit
+        page = rows[:limit]
+        next_cursor = (
+            _encode_cursor(page[-1].created_at, page[-1].id)
+            if has_more and page else None
+        )
+        return RunListResponse(
+            runs=[_row_to_row(r) for r in page],
+            next_cursor=next_cursor,
+        )
+
+
+def _row_to_detail(run: Run) -> RunDetail:
+    """Translate a DB Run row into the public RunDetail shape.
+
+    RunDetail is currently a RunRow alias (same fields), so we delegate
+    to `_row_to_row` and rebuild the subclass from the dict. Keeps the
+    13-field mapping in one place.
+    """
+    return RunDetail.model_validate(_row_to_row(run).model_dump())
 
 
 @router.get("/{run_id}", response_model=RunDetail)

@@ -17,6 +17,7 @@ import {
   parseManifest,
   sha256Hex,
   uninstallSkill,
+  verifySkillSignature,
 } from "../src/skills-registry.js";
 
 
@@ -209,6 +210,221 @@ describe("installSkill", () => {
     };
     const res = await installSkill(root, manifest);
     expect(readFileSync(res.installedPath, "utf-8")).toBe(body);
+  });
+});
+
+
+// --- Cosign-style signature verification (W7.3 follow-up) -----------
+
+describe("verifySkillSignature", () => {
+  // Generate a real ed25519 keypair once per describe — using stdlib
+  // crypto so the test suite stays free of any signing tools. Sign a
+  // known body, then assert verifySkillSignature accepts the right
+  // body and rejects everything else.
+  const { generateKeyPairSync, sign: cryptoSign } = require("node:crypto");
+  const body = "# python testing\n\nUse pytest.\n";
+
+  it("accepts a valid ed25519 signature", () => {
+    const { publicKey, privateKey } = generateKeyPairSync("ed25519");
+    const sig = cryptoSign(null, Buffer.from(body, "utf-8"), privateKey);
+    const err = verifySkillSignature(body, {
+      algorithm: "ed25519",
+      publicKeyPem: publicKey.export({ type: "spki", format: "pem" }) as string,
+      signatureBase64: sig.toString("base64"),
+    });
+    expect(err).toBeNull();
+  });
+
+  it("rejects when the body is tampered (signature stops matching)", () => {
+    const { publicKey, privateKey } = generateKeyPairSync("ed25519");
+    const sig = cryptoSign(null, Buffer.from(body, "utf-8"), privateKey);
+    const err = verifySkillSignature("# tampered\n", {
+      algorithm: "ed25519",
+      publicKeyPem: publicKey.export({ type: "spki", format: "pem" }) as string,
+      signatureBase64: sig.toString("base64"),
+    });
+    expect(err).toMatch(/did not verify/);
+  });
+
+  it("rejects when the public key is from a different signer", () => {
+    const { privateKey: signerKey } = generateKeyPairSync("ed25519");
+    const { publicKey: attackerPub } = generateKeyPairSync("ed25519");
+    const sig = cryptoSign(null, Buffer.from(body, "utf-8"), signerKey);
+    const err = verifySkillSignature(body, {
+      algorithm: "ed25519",
+      publicKeyPem: attackerPub.export({ type: "spki", format: "pem" }) as string,
+      signatureBase64: sig.toString("base64"),
+    });
+    expect(err).toMatch(/did not verify/);
+  });
+
+  it("rejects a malformed publicKeyPem cleanly (no crash)", () => {
+    const err = verifySkillSignature(body, {
+      algorithm: "ed25519",
+      publicKeyPem: "-----BEGIN PUBLIC KEY-----\nnot-a-real-key\n-----END PUBLIC KEY-----",
+      signatureBase64: Buffer.from("garbage").toString("base64"),
+    });
+    expect(err).toMatch(/publicKeyPem could not be parsed|did not verify/);
+  });
+
+  it("rejects an empty signatureBase64", () => {
+    const { publicKey } = generateKeyPairSync("ed25519");
+    const err = verifySkillSignature(body, {
+      algorithm: "ed25519",
+      publicKeyPem: publicKey.export({ type: "spki", format: "pem" }) as string,
+      signatureBase64: "",
+    });
+    expect(err).toMatch(/zero bytes|decoded/);
+  });
+
+  it("verifies an RSA-PSS-SHA256 signature too", () => {
+    const { publicKey, privateKey } = generateKeyPairSync("rsa", {
+      modulusLength: 2048,
+    });
+    const sig = cryptoSign(
+      "sha256",
+      Buffer.from(body, "utf-8"),
+      { key: privateKey, padding: 6 /* RSA_PKCS1_PSS_PADDING */ },
+    );
+    const err = verifySkillSignature(body, {
+      algorithm: "rsa-pss-sha256",
+      publicKeyPem: publicKey.export({ type: "spki", format: "pem" }) as string,
+      signatureBase64: sig.toString("base64"),
+    });
+    expect(err).toBeNull();
+  });
+});
+
+
+describe("parseManifest signature shape", () => {
+  const validBody = {
+    id: "x", version: "1.0.0", description: "...",
+    url: "https://e/x.md", sha256: "a".repeat(64),
+  };
+
+  it("accepts a manifest without a signature (back-compat)", () => {
+    const out = parseManifest(validBody);
+    expect(typeof out).toBe("object");
+  });
+
+  it("accepts a manifest with a well-formed signature block", () => {
+    const out = parseManifest({
+      ...validBody,
+      signature: {
+        algorithm: "ed25519",
+        publicKeyPem: "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEA...\n-----END PUBLIC KEY-----",
+        signatureBase64: "abcd",
+      },
+    });
+    expect(typeof out).toBe("object");
+    if (typeof out !== "string") {
+      expect(out.signature?.algorithm).toBe("ed25519");
+    }
+  });
+
+  it("rejects an unknown signature algorithm", () => {
+    const out = parseManifest({
+      ...validBody,
+      signature: {
+        algorithm: "secp256k1",
+        publicKeyPem: "-----BEGIN PUBLIC KEY-----\nx\n-----END PUBLIC KEY-----",
+        signatureBase64: "abcd",
+      },
+    });
+    expect(typeof out).toBe("string");
+    expect(out).toMatch(/algorithm/);
+  });
+
+  it("rejects a publicKeyPem that isn't PEM-shaped", () => {
+    const out = parseManifest({
+      ...validBody,
+      signature: {
+        algorithm: "ed25519",
+        publicKeyPem: "not-a-pem-block",
+        signatureBase64: "abcd",
+      },
+    });
+    expect(typeof out).toBe("string");
+    expect(out).toMatch(/PEM/);
+  });
+});
+
+
+describe("installSkill with signatures", () => {
+  let root: string;
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "skill-sig-"));
+  });
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true });
+    delete process.env.CLAW_SKILLS_REQUIRE_SIGNATURE;
+  });
+
+  it("installs a signed skill when the signature verifies", async () => {
+    const { generateKeyPairSync, sign } = require("node:crypto");
+    const { publicKey, privateKey } = generateKeyPairSync("ed25519");
+    const body = "# signed skill\n";
+    const sig = sign(null, Buffer.from(body, "utf-8"), privateKey);
+    const manifest = {
+      id: "signed", version: "1.0.0", description: "...",
+      url: "https://e/signed.md",
+      sha256: sha256Hex(body),
+      signature: {
+        algorithm: "ed25519" as const,
+        publicKeyPem: publicKey.export({ type: "spki", format: "pem" }) as string,
+        signatureBase64: sig.toString("base64"),
+      },
+    };
+    const fetcher = fakeFetch({ [manifest.url]: body });
+    const res = await installSkill(root, manifest, fetcher);
+    expect(res.installedPath).toMatch(/signed\.md$/);
+  });
+
+  it("refuses to install when the signature is wrong", async () => {
+    const { generateKeyPairSync, sign } = require("node:crypto");
+    const { privateKey } = generateKeyPairSync("ed25519");
+    const { publicKey: otherPub } = generateKeyPairSync("ed25519");
+    const body = "# signed skill\n";
+    const sig = sign(null, Buffer.from(body, "utf-8"), privateKey);
+    // publicKey is from a *different* keypair → verification fails.
+    const manifest = {
+      id: "signed", version: "1.0.0", description: "...",
+      url: "https://e/signed.md",
+      sha256: sha256Hex(body),
+      signature: {
+        algorithm: "ed25519" as const,
+        publicKeyPem: otherPub.export({ type: "spki", format: "pem" }) as string,
+        signatureBase64: sig.toString("base64"),
+      },
+    };
+    const fetcher = fakeFetch({ [manifest.url]: body });
+    await expect(installSkill(root, manifest, fetcher)).rejects.toThrow(
+      /signature verification failed/,
+    );
+  });
+
+  it("CLAW_SKILLS_REQUIRE_SIGNATURE=1 rejects unsigned manifests", async () => {
+    process.env.CLAW_SKILLS_REQUIRE_SIGNATURE = "1";
+    const body = "# unsigned\n";
+    const manifest = {
+      id: "unsigned", version: "1.0.0", description: "...",
+      url: "https://e/unsigned.md", sha256: sha256Hex(body),
+    };
+    const fetcher = fakeFetch({ [manifest.url]: body });
+    await expect(installSkill(root, manifest, fetcher)).rejects.toThrow(
+      /no signature/,
+    );
+  });
+
+  it("CLAW_SKILLS_REQUIRE_SIGNATURE unset still permits unsigned (default)", async () => {
+    const body = "# unsigned but pre-signature env\n";
+    const manifest = {
+      id: "unsigned", version: "1.0.0", description: "...",
+      url: "https://e/unsigned.md", sha256: sha256Hex(body),
+    };
+    const fetcher = fakeFetch({ [manifest.url]: body });
+    const res = await installSkill(root, manifest, fetcher);
+    expect(res.installedPath).toMatch(/unsigned\.md$/);
   });
 });
 

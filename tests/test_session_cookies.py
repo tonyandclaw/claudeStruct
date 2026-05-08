@@ -245,3 +245,122 @@ def test_session_cookie_name_is_consistent():
     # but exposes the name indirectly through current_principal.
     from claudestruct.server.routers.oauth import SESSION_COOKIE_NAME
     assert SESSION_COOKIE_NAME == "claudestruct_session"
+
+
+# ---------------------------------------------------------------------------
+# Customer-success audit events (A.5)
+# ---------------------------------------------------------------------------
+
+def test_logout_writes_auth_logout_audit_event(session_cookie_env):
+    """`auth.logout` audit row lands so support / admins can see when
+    a session ended. Verifies the event is in the chain *and* never
+    leaks the cookie value into the audit row."""
+    from sqlalchemy import select
+
+    from claudestruct.server.audit import AuditEntry
+    from claudestruct.server.models import UserSession
+
+    env = session_cookie_env
+    factory = env["app"].state.session_factory
+
+    env["client"].post(
+        "/v1/auth/logout",
+        cookies={"claudestruct_session": env["session_token"]},
+    )
+
+    with factory() as s:
+        sess = s.execute(
+            select(UserSession).where(
+                UserSession.session_token == env["session_token"]
+            )
+        ).scalar_one()
+        rows = s.execute(
+            select(AuditEntry).where(AuditEntry.action == "auth.logout")
+        ).scalars().all()
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.org_id == sess.org_id
+    assert row.actor_user_id == sess.user_id
+    assert row.resource_type == "user_session"
+    assert row.resource_id == str(sess.id)
+    # The cookie value (sensitive) must NOT show up anywhere in the
+    # audit payload — only the row id + provider.
+    assert env["session_token"] not in (row.payload_json or "")
+    assert "github" in (row.payload_json or "")
+
+
+def test_idempotent_logout_does_not_double_audit(session_cookie_env):
+    """Two logout calls for the same cookie write only one audit row.
+    The second call is a no-op (session already revoked); we shouldn't
+    audit the no-op as if it were a fresh logout."""
+    from sqlalchemy import select
+
+    from claudestruct.server.audit import AuditEntry
+
+    env = session_cookie_env
+    env["client"].post(
+        "/v1/auth/logout",
+        cookies={"claudestruct_session": env["session_token"]},
+    )
+    env["client"].post(
+        "/v1/auth/logout",
+        cookies={"claudestruct_session": env["session_token"]},
+    )
+
+    factory = env["app"].state.session_factory
+    with factory() as s:
+        rows = s.execute(
+            select(AuditEntry).where(AuditEntry.action == "auth.logout")
+        ).scalars().all()
+    assert len(rows) == 1
+
+
+def test_oauth_callback_writes_auth_login_success_audit_event(
+    session_cookie_env, monkeypatch,
+):
+    """A successful GitHub OAuth callback writes `auth.login.success`."""
+    from sqlalchemy import select
+
+    from claudestruct.server import oauth as oauth_mod
+    from claudestruct.server.audit import AuditEntry
+
+    env = session_cookie_env
+    user_email = env["user_email"]
+
+    # Stub the OAuth helpers so we don't hit GitHub.
+    class _StubCfg:
+        client_id = "test"
+        client_secret = "test"
+        redirect_uri = "http://test/callback"
+
+    monkeypatch.setattr(oauth_mod, "load_github_config", lambda: _StubCfg())
+    monkeypatch.setattr(
+        oauth_mod, "exchange_code_for_token",
+        lambda cfg, code, http_client=None: "stub-token",
+    )
+    monkeypatch.setattr(
+        oauth_mod, "fetch_github_user",
+        lambda token, http_client=None: {"email": user_email, "login": "alice"},
+    )
+    env["app"].state.oauth_http_client = lambda: object()
+    env["app"].state.oauth_post_login_url = "/"
+
+    # The callback expects a state cookie matching the query param.
+    state = "csrf-state"
+    env["client"].cookies.set("claudestruct_oauth_state", state)
+    r = env["client"].get(
+        f"/v1/auth/github/callback?code=stub-code&state={state}",
+        follow_redirects=False,
+    )
+    # 302 redirect to "/" on success.
+    assert r.status_code in (302, 307)
+
+    factory = env["app"].state.session_factory
+    with factory() as s:
+        rows = s.execute(
+            select(AuditEntry).where(AuditEntry.action == "auth.login.success")
+        ).scalars().all()
+    assert len(rows) == 1
+    assert rows[0].resource_type == "user_session"
+    assert "github" in (rows[0].payload_json or "")

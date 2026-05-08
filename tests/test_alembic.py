@@ -92,21 +92,27 @@ def test_versions_directory_exists():
 
 
 def test_baseline_migration_is_present(script):
-    """The seeded baseline migration is the one and only head."""
+    """At least one migration exists. As the schema evolves we'll
+    accumulate more migrations on top, so this test only asserts a
+    non-empty chain rather than counting heads."""
     heads = script.get_heads()
     assert len(heads) == 1, (
-        f"Expected exactly one head revision (the baseline); "
-        f"found {len(heads)}: {heads}"
+        f"Expected exactly one head revision; found {len(heads)}: {heads}"
     )
 
 
-def test_baseline_migration_has_no_parent(script):
-    """The baseline migration is the chain root (down_revision is None)."""
+def test_chain_has_a_root_revision(script):
+    """Walking from head to base must reach a revision with
+    `down_revision=None` — i.e. a real chain root, not a dangling
+    branch. `alembic upgrade head` on a fresh DB only succeeds when
+    the chain has a root."""
     head_id = script.get_heads()[0]
-    head_rev = script.get_revision(head_id)
-    assert head_rev.down_revision is None, (
-        "Baseline migration must have down_revision=None so "
-        "`alembic upgrade head` works on a fresh DB."
+    revs = list(script.walk_revisions(base="base", head=head_id))
+    assert revs, "no revisions in the chain"
+    root = revs[-1]
+    assert root.down_revision is None, (
+        f"Chain root {root.revision!r} has down_revision="
+        f"{root.down_revision!r}; expected None."
     )
 
 
@@ -160,3 +166,50 @@ def test_alembic_api_importable():
 
     from alembic import context
     assert callable(context.configure)  # smoke check
+
+
+def test_runs_table_has_query_path_indexes(tmp_path):
+    """Lock the indexes the SLO / dashboard / alert detectors rely
+    on. Without these, the rolling-window queries
+    (`Run.created_at >= cutoff`) scan the full table at every poll.
+    """
+    from alembic.config import Config as AlembicConfig
+    from sqlalchemy import create_engine, inspect
+
+    from alembic import command
+
+    db_path = tmp_path / "indexes.db"
+    db_url = f"sqlite:///{db_path}"
+    root = Path(__file__).parent.parent
+    cfg = AlembicConfig(str(root / "alembic.ini"))
+    cfg.set_main_option("script_location", str(root / "alembic"))
+    import os as _os
+    _prev = _os.environ.get("DATABASE_URL")
+    _os.environ["DATABASE_URL"] = db_url
+    try:
+        command.upgrade(cfg, "head")
+    finally:
+        if _prev is None:
+            _os.environ.pop("DATABASE_URL", None)
+        else:
+            _os.environ["DATABASE_URL"] = _prev
+
+    engine = create_engine(db_url)
+    inspector = inspect(engine)
+    runs_indexes = {ix["name"] for ix in inspector.get_indexes("runs")}
+    expected = {
+        "ix_runs_org_id",
+        "ix_runs_status",
+        "ix_runs_user_id",
+        "ix_runs_run_id",
+        "ix_runs_created_at",
+        "ix_runs_started_at",
+        "ix_runs_ended_at",
+        "ix_runs_idempotency_key",
+    }
+    missing = expected - runs_indexes
+    assert not missing, (
+        f"Missing index(es) on `runs`: {missing}. The SLO / dashboard / "
+        f"alert detectors rely on these — adding a column to the table "
+        f"shouldn't drop them. Regenerate the migration."
+    )
