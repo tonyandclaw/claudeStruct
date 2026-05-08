@@ -17,7 +17,7 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/claw-sandbox .
 # Keep this Debian-based so the Node binary copied into the final
 # python:slim image uses the same glibc runtime. Alpine's musl-built
 # node binary will not run reliably after being copied into Debian.
-FROM node:22-bookworm-slim AS ts-builder
+FROM node:26-bookworm-slim AS ts-builder
 WORKDIR /app
 RUN npm install -g pnpm@10
 COPY claw-squad/package.json claw-squad/pnpm-lock.yaml ./
