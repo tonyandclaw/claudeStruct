@@ -75,6 +75,8 @@ nav:
       - Skills marketplace: claw-squad/skills-marketplace.md
   - Integrations: integrations.md
   - Contributing: contributing.md
-  - Security: security.md
+  - Security:
+      - Policy: security.md
+      - Threat model: threat-model.md
   - Changelog: changelog.md
   - Roadmap: roadmap.md
