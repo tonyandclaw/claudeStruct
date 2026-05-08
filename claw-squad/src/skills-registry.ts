@@ -38,7 +38,7 @@
  *   - `claw-squad skills install <url>`   -- ad-hoc install of a manifest URL
  *   - `claw-squad skills uninstall <id>`  -- remove from .claw-squad/skills/
  */
-import { createHash } from "node:crypto";
+import { createHash, createPublicKey, verify as cryptoVerify } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -46,6 +46,31 @@ import { skillsDir } from "./skills.js";
 
 
 export const DEFAULT_REGISTRY_URL = "https://skills.claudestruct.dev/index.json";
+
+
+/** Optional cryptographic signature attached to a manifest.
+ *
+ * Cosign-compatible offline verification: the signer publishes the
+ * skill body once, signs it with their private key, and ships the
+ * signature alongside the manifest. We verify before the sha256
+ * check so a wrong key fails fast (no point hashing 50 KB of body
+ * if the signer is wrong).
+ *
+ * Why not full cosign-with-Rekor? Cosign's transparency-log flow
+ * needs network access at install time and pulls in the cosign Go
+ * binary. The PEM-based offline verification implemented here gets
+ * us the same tamper-evidence as long as the install host trusts
+ * the configured public key. The Rekor layer can land later.
+ */
+export interface SkillSignature {
+  /** "ed25519" (preferred — small keys, fast verify) or
+   *  "rsa-pss-sha256" (broader compatibility). */
+  algorithm: "ed25519" | "rsa-pss-sha256";
+  /** PEM-encoded public key (SPKI). */
+  publicKeyPem: string;
+  /** Base64-encoded signature over the raw skill body bytes. */
+  signatureBase64: string;
+}
 
 
 export interface SkillManifest {
@@ -58,6 +83,11 @@ export interface SkillManifest {
   license?: string;
   homepage?: string;
   publishedAt?: string;
+  /** Optional cosign-style signature. When present we verify before
+   * the sha256 check; when absent, sha256 alone is the integrity
+   * signal (operators can opt-in to required-signature mode via
+   * `CLAW_SKILLS_REQUIRE_SIGNATURE=1`). */
+  signature?: SkillSignature;
 }
 
 
@@ -80,6 +110,29 @@ export function parseManifest(raw: unknown): SkillManifest | string {
   if (!/^[a-f0-9]{64}$/i.test(m.sha256 as string)) {
     return `manifest sha256 must be 64 hex chars`;
   }
+  // Optional signature block. Validate shape; we don't verify here —
+  // verification happens at install time against the body.
+  let signature: SkillSignature | undefined;
+  if (m.signature !== undefined) {
+    if (!m.signature || typeof m.signature !== "object") {
+      return `manifest field "signature" must be an object`;
+    }
+    const s = m.signature as Record<string, unknown>;
+    if (s.algorithm !== "ed25519" && s.algorithm !== "rsa-pss-sha256") {
+      return `manifest signature.algorithm must be "ed25519" or "rsa-pss-sha256"`;
+    }
+    if (typeof s.publicKeyPem !== "string" || !s.publicKeyPem.includes("BEGIN PUBLIC KEY")) {
+      return `manifest signature.publicKeyPem must be a PEM-encoded public key`;
+    }
+    if (typeof s.signatureBase64 !== "string" || !s.signatureBase64) {
+      return `manifest signature.signatureBase64 must be a non-empty base64 string`;
+    }
+    signature = {
+      algorithm: s.algorithm,
+      publicKeyPem: s.publicKeyPem,
+      signatureBase64: s.signatureBase64,
+    };
+  }
   return {
     id: m.id as string,
     version: m.version as string,
@@ -90,7 +143,65 @@ export function parseManifest(raw: unknown): SkillManifest | string {
     license: typeof m.license === "string" ? m.license : undefined,
     homepage: typeof m.homepage === "string" ? m.homepage : undefined,
     publishedAt: typeof m.publishedAt === "string" ? m.publishedAt : undefined,
+    signature,
   };
+}
+
+
+/** Verify a cosign-style signature against the raw skill body bytes.
+ *
+ * Returns null on success, or a human-readable error string on
+ * failure. We never throw — callers decide whether to abort install
+ * or fall back to sha256-only.
+ */
+export function verifySkillSignature(
+  body: string,
+  signature: SkillSignature,
+): string | null {
+  let publicKey;
+  try {
+    publicKey = createPublicKey(signature.publicKeyPem);
+  } catch (err) {
+    return `signature publicKeyPem could not be parsed: ${(err as Error).message}`;
+  }
+  let sigBytes: Buffer;
+  try {
+    sigBytes = Buffer.from(signature.signatureBase64, "base64");
+    if (sigBytes.length === 0) {
+      return "signatureBase64 decoded to zero bytes";
+    }
+  } catch (err) {
+    return `signatureBase64 could not be decoded: ${(err as Error).message}`;
+  }
+  const bodyBytes = Buffer.from(body, "utf-8");
+  // ed25519 takes algorithm=null (the algorithm is implicit in the
+  // key). RSA-PSS-SHA256 takes 'sha256' + the salt-length default.
+  const algForVerify = signature.algorithm === "ed25519" ? null : "sha256";
+  let ok = false;
+  try {
+    if (signature.algorithm === "rsa-pss-sha256") {
+      // Must explicitly request PSS padding; the default for an RSA
+      // key is PKCS#1 v1.5 which would silently accept a different
+      // signature scheme.
+      ok = cryptoVerify(
+        algForVerify,
+        bodyBytes,
+        {
+          key: publicKey,
+          padding: 6, // crypto.constants.RSA_PKCS1_PSS_PADDING
+        },
+        sigBytes,
+      );
+    } else {
+      ok = cryptoVerify(algForVerify, bodyBytes, publicKey, sigBytes);
+    }
+  } catch (err) {
+    return `signature verification crashed: ${(err as Error).message}`;
+  }
+  if (!ok) {
+    return `signature did not verify against the provided publicKeyPem`;
+  }
+  return null;
 }
 
 
@@ -142,14 +253,33 @@ export interface InstallResult {
 }
 
 
-/** Fetch the .md body, verify the sha256 matches the manifest, and
- * write to `<repoRoot>/.claw-squad/skills/<id>.md`. Throws on any
- * mismatch — silent corruption would defeat the whole point. */
+/** Fetch the .md body, verify the sha256 (and optional cosign-style
+ * signature) match the manifest, and write to
+ * `<repoRoot>/.claw-squad/skills/<id>.md`. Throws on any mismatch —
+ * silent corruption would defeat the whole point.
+ *
+ * When `process.env.CLAW_SKILLS_REQUIRE_SIGNATURE=1` is set, an
+ * unsigned manifest is rejected before any IO happens. This is the
+ * lever air-gapped / regulated environments flip when sha256 alone
+ * isn't sufficient (the registry author could swap both the body
+ * and the manifest hash; only a private key they don't have can't
+ * fake a signature).
+ */
 export async function installSkill(
   repoRoot: string,
   manifest: SkillManifest,
   fetcher: typeof fetch = fetch,
 ): Promise<InstallResult> {
+  if (
+    process.env.CLAW_SKILLS_REQUIRE_SIGNATURE === "1" &&
+    !manifest.signature
+  ) {
+    throw new Error(
+      `skill "${manifest.id}" has no signature but CLAW_SKILLS_REQUIRE_SIGNATURE=1 ` +
+      `is set. Refusing to install (sha256 alone is insufficient when the registry ` +
+      `host isn't trusted).`,
+    );
+  }
   let body: string;
   if (manifest.url.startsWith("file://") || manifest.url.startsWith("/")) {
     const path = manifest.url.startsWith("file://")
@@ -162,6 +292,18 @@ export async function installSkill(
       throw new Error(`skill body GET ${manifest.url} failed: ${res.status} ${res.statusText}`);
     }
     body = await res.text();
+  }
+  // Signature first: a wrong key fails fast before we hash a 50 KB
+  // body, and the error message tells the operator the actual
+  // problem (key drift) rather than just "sha256 mismatch".
+  if (manifest.signature) {
+    const sigErr = verifySkillSignature(body, manifest.signature);
+    if (sigErr) {
+      throw new Error(
+        `signature verification failed for skill "${manifest.id}": ${sigErr}. ` +
+        `Refusing to install (key drift, tampered body, or wrong manifest).`,
+      );
+    }
   }
   const observed = sha256Hex(body);
   if (observed !== manifest.sha256.toLowerCase()) {
