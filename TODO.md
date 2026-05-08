@@ -215,7 +215,7 @@ Goal: trust this in CI pipelines and long-running daemons. Wave 4 makes it insta
   - Coverage gate via `coverage` (`fail_under = 70`; current run hits 80% with CLI/MCP entry points excluded as integration-tested)
   - CI workflow installs `pytest coverage ruff` and runs lint → coverage-gated pytest
   - End-to-end tests with mocked Anthropic SDK shipped: `tests/test_e2e_cli.py` (10 cases) covers the four task commands' happy paths + cost summary + cached-badge surface + provider-side `ClaudestructError` exit-code behaviour + `--log-json` event contract (`run.start` / `agent.usage` / `run.end`) + `--effort xhigh` flag plumbing through to the provider. An autouse fixture stubs `count_tokens` + sets a dummy API key so no test reaches Anthropic.
-  - Pending: mutation testing (mutmut / stryker) — heavy CI cost, deferred until a scheduled / nightly job slot is set up
+  - **Mutation-testing nightly slot (this PR)**: `.github/workflows/mutation.yml` runs `mutmut` on a 03:17 UTC cron + `workflow_dispatch`. `[tool.mutmut]` in `pyproject.toml` targets `server/billing.py` (critical money logic) + `prompts.py` (drives every LLM call) — narrow surface so the first run completes inside one Actions slot. New `[mutation]` extra packages `mutmut>=2.4`. The job is **signal-only today**: `mutmut run || true` keeps the workflow green while we tune the kill-rate floor; flipping the `|| true` switches it to a gate. `.mutmut-cache` archived as a workflow artefact so a human can `mutmut html` locally to drill into surviving mutants without re-running the suite. 6 new tests in `tests/test_mutation_workflow.py` lock the workflow + pyproject shape against silent regressions.
 
 ---
 

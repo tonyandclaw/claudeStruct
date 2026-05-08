@@ -77,6 +77,14 @@ voice = [
   "sounddevice>=0.4",
   "numpy>=1.24",
 ]
+# `pip install claudestruct[mutation]` to run the W5.7 nightly
+# mutation-testing job locally. The CI workflow installs this same
+# extra; not part of the default install because mutmut pulls in
+# parso + a handful of utilities that double the wheel cache for
+# every contributor who never runs the mutation suite.
+mutation = [
+  "mutmut>=2.4",
+]
 
 [project.scripts]
 cs = "claudestruct.cli:main"
@@ -142,3 +150,18 @@ exclude_lines = [
   "if __name__ == .__main__.:",
   "if TYPE_CHECKING:",
 ]
+
+# --- Mutation testing (W5.7 follow-up) -----------------------------
+#
+# Nightly job in .github/workflows/mutation.yml runs mutmut against
+# the modules listed below. Started narrow (billing.py + prompts.py)
+# so the first run completes inside a single GitHub Actions slot;
+# expand the list as the suite hardens. We are NOT gating CI on the
+# mutation score yet — the job collects signal so we can tune the
+# `--paths-to-mutate` set and the kill-rate floor before failing
+# anything.
+[tool.mutmut]
+paths_to_mutate = "src/claudestruct/server/billing.py,src/claudestruct/prompts.py"
+runner = "python -m pytest -x -q tests/test_billing.py tests/test_prompts.py"
+tests_dir = "tests/"
+backup = false

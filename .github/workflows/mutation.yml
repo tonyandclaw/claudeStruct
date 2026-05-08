@@ -1,0 +1,74 @@
+name: Mutation testing
+
+# W5.7 — collect mutation-test signal nightly so we can tune the
+# kill-rate floor before turning it into a CI gate. Targets a small
+# core surface (billing + prompts) for the first iteration; expand
+# the [tool.mutmut].paths_to_mutate list as the suite hardens.
+
+on:
+  schedule:
+    # 03:17 UTC nightly — off the hour to avoid the GHA cron stampede.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mutation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  mutmut:
+    name: mutmut (collect-only)
+    runs-on: ubuntu-latest
+    # Mutation runs are inherently slow (one mutated test-suite per
+    # mutant). Cap so a runaway run can't burn the whole nightly
+    # window; expand if the target surface grows.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install package + test + mutation extras
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[server,mutation]'
+          python -m pip install pytest
+
+      # `mutmut run` exits 2 when surviving mutants exist. We don't
+      # gate on that yet (signal-only mode); `|| true` keeps the
+      # workflow green so the report-and-archive steps below always
+      # run. Flip to `mutmut run` (no `|| true`) when we're ready to
+      # gate.
+      - name: Run mutmut (collect signal, do not gate)
+        run: |
+          mutmut run || true
+
+      - name: Print mutation summary
+        run: |
+          mutmut results || true
+          echo "---"
+          echo "Reminder: this job is signal-only today. Once the"
+          echo "kill rate stabilises and the surviving-mutant set"
+          echo "is reviewed, drop the '|| true' on the run step to"
+          echo "make this a gate."
+
+      - name: Archive mutmut cache + results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutmut-${{ github.run_id }}
+          # `.mutmut-cache` (sqlite) is what later `mutmut results` /
+          # `mutmut html` calls read from; uploading it lets a human
+          # rerun `mutmut html` locally to drill into specific
+          # surviving mutants without re-running the whole suite.
+          path: |
+            .mutmut-cache
+            mutants/
+          if-no-files-found: ignore
