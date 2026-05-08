@@ -251,6 +251,191 @@ def test_webhook_503_when_stripe_not_installed(env):
     assert "stripe" in r.json()["detail"].lower()
 
 
+# --- /v1/billing/invoices/{id}/pdf passthrough (W8.2) ---------------
+
+
+class _FakeStripeError(Exception):
+    pass
+
+
+class _FakeInvalidRequestError(_FakeStripeError):
+    pass
+
+
+class _FakeInvoice:
+    """Mimics the subset of stripe.Invoice that our route reads.
+
+    Real `stripe.Invoice` is dict-like but also exposes attribute
+    access. The route handles both; we use attribute access here so
+    the test catches a regression that depends on `__getitem__`.
+    """
+
+    def __init__(
+        self,
+        *,
+        customer: str,
+        invoice_pdf: str | None = "https://files.stripe.com/x.pdf",
+        hosted_invoice_url: str | None = "https://invoice.stripe.com/y",
+    ) -> None:
+        self.customer = customer
+        self.invoice_pdf = invoice_pdf
+        self.hosted_invoice_url = hosted_invoice_url
+
+
+def _install_fake_stripe(
+    monkeypatch,
+    *,
+    invoice: _FakeInvoice | None = None,
+    raise_invalid: bool = False,
+    raise_other: bool = False,
+):
+    """Inject a fake `stripe` module into sys.modules so the route's
+    `import stripe` succeeds. Also flips `stripe_sdk_available()` to
+    True for the duration of the test."""
+    import sys
+    import types
+
+    fake = types.ModuleType("stripe")
+    fake.StripeError = _FakeStripeError  # type: ignore[attr-defined]
+    fake.InvalidRequestError = _FakeInvalidRequestError  # type: ignore[attr-defined]
+
+    class _InvoiceNs:
+        @staticmethod
+        def retrieve(invoice_id: str):
+            if raise_invalid:
+                raise _FakeInvalidRequestError("no such invoice")
+            if raise_other:
+                raise _FakeStripeError("upstream timeout")
+            return invoice
+
+    fake.Invoice = _InvoiceNs  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "stripe", fake)
+    monkeypatch.setattr(billing_mod, "stripe_sdk_available", lambda: True)
+
+
+def _seed_subscription_with_customer(env, customer_id: str | None) -> None:
+    """Set the org's subscription.stripe_customer_id directly."""
+    factory = env["factory"]
+    with factory() as session:
+        org_id = session.query(Org).first().id
+        sub = billing_mod.get_or_default(session, org_id)
+        sub.stripe_customer_id = customer_id
+        session.commit()
+
+
+def test_invoice_pdf_503_when_stripe_not_installed(env):
+    """Without stripe SDK, the route fails closed with 503."""
+    r = env["client"].get(
+        "/v1/billing/invoices/in_test/pdf",
+        headers=_auth(env["keys"]["viewer@a"]),
+    )
+    assert r.status_code == 503
+    assert "stripe" in r.json()["detail"].lower()
+
+
+def test_invoice_pdf_unauthenticated_401(env, monkeypatch):
+    _install_fake_stripe(monkeypatch, invoice=_FakeInvoice(customer="cus_x"))
+    r = env["client"].get("/v1/billing/invoices/in_test/pdf")
+    assert r.status_code == 401
+
+
+def test_invoice_pdf_404_when_org_has_no_stripe_customer(env, monkeypatch):
+    """Org never went through Checkout → no stripe_customer_id →
+    404 (must be indistinguishable from a wrong / unknown invoice)."""
+    _install_fake_stripe(monkeypatch, invoice=_FakeInvoice(customer="cus_other"))
+    # Org's stripe_customer_id is left None (default).
+    r = env["client"].get(
+        "/v1/billing/invoices/in_test/pdf",
+        headers=_auth(env["keys"]["viewer@a"]),
+    )
+    assert r.status_code == 404
+    assert r.json()["detail"] == "invoice not found"
+
+
+def test_invoice_pdf_happy_path(env, monkeypatch):
+    """Caller's stripe_customer_id matches invoice.customer →
+    return the PDF URL."""
+    _seed_subscription_with_customer(env, customer_id="cus_acme")
+    _install_fake_stripe(
+        monkeypatch,
+        invoice=_FakeInvoice(
+            customer="cus_acme",
+            invoice_pdf="https://files.stripe.com/abc.pdf",
+            hosted_invoice_url="https://invoice.stripe.com/i/abc",
+        ),
+    )
+    r = env["client"].get(
+        "/v1/billing/invoices/in_test/pdf",
+        headers=_auth(env["keys"]["viewer@a"]),
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["invoice_id"] == "in_test"
+    assert body["invoice_pdf_url"] == "https://files.stripe.com/abc.pdf"
+    assert body["hosted_invoice_url"] == "https://invoice.stripe.com/i/abc"
+
+
+def test_invoice_pdf_cross_tenant_returns_404_not_403(env, monkeypatch):
+    """An invoice whose `customer` doesn't match the caller's
+    `stripe_customer_id` must return 404 — otherwise the endpoint
+    is a customer-id enumeration oracle."""
+    _seed_subscription_with_customer(env, customer_id="cus_acme")
+    _install_fake_stripe(
+        monkeypatch,
+        invoice=_FakeInvoice(customer="cus_other_tenant"),
+    )
+    r = env["client"].get(
+        "/v1/billing/invoices/in_test/pdf",
+        headers=_auth(env["keys"]["viewer@a"]),
+    )
+    assert r.status_code == 404
+    assert r.json()["detail"] == "invoice not found"
+
+
+def test_invoice_pdf_unknown_invoice_id_returns_404(env, monkeypatch):
+    """Stripe's InvalidRequestError (unknown ID, malformed) → 404."""
+    _seed_subscription_with_customer(env, customer_id="cus_acme")
+    _install_fake_stripe(monkeypatch, raise_invalid=True)
+    r = env["client"].get(
+        "/v1/billing/invoices/in_unknown/pdf",
+        headers=_auth(env["keys"]["viewer@a"]),
+    )
+    assert r.status_code == 404
+
+
+def test_invoice_pdf_upstream_stripe_error_returns_502(env, monkeypatch):
+    """Network blip / Stripe outage → 502 so the frontend can
+    distinguish a transient upstream failure from an unknown ID."""
+    _seed_subscription_with_customer(env, customer_id="cus_acme")
+    _install_fake_stripe(monkeypatch, raise_other=True)
+    r = env["client"].get(
+        "/v1/billing/invoices/in_test/pdf",
+        headers=_auth(env["keys"]["viewer@a"]),
+    )
+    assert r.status_code == 502
+    assert "Stripe" in r.json()["detail"]
+
+
+def test_invoice_pdf_409_when_pdf_not_yet_finalised(env, monkeypatch):
+    """Draft invoice with no `invoice_pdf` yet → 409 so the frontend
+    knows to retry rather than redirect to a 404 page."""
+    _seed_subscription_with_customer(env, customer_id="cus_acme")
+    _install_fake_stripe(
+        monkeypatch,
+        invoice=_FakeInvoice(
+            customer="cus_acme",
+            invoice_pdf=None,
+            hosted_invoice_url=None,
+        ),
+    )
+    r = env["client"].get(
+        "/v1/billing/invoices/in_draft/pdf",
+        headers=_auth(env["keys"]["viewer@a"]),
+    )
+    assert r.status_code == 409
+    assert "not yet available" in r.json()["detail"]
+
+
 def test_free_tier_token_cap():
     assert billing_mod.free_tier_token_cap() == 100_000
 

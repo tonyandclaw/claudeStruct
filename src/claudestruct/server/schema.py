@@ -262,6 +262,19 @@ class CheckoutResponse(BaseModel):
     )
 
 
+class InvoicePdfResponse(BaseModel):
+    """Passthrough wrapper for Stripe's signed `invoice_pdf` URL.
+
+    Stripe's hosted PDF URLs are short-lived signed links. We return
+    them to the caller rather than 302-redirecting so the browser
+    doesn't drop the bearer token while following the redirect, and
+    so the frontend can decide whether to inline-render or download.
+    """
+    invoice_id: str
+    invoice_pdf_url: str
+    hosted_invoice_url: str | None = None
+
+
 class UsageResponse(BaseModel):
     """Period-to-date token usage. Mirrors the budget endpoint shape
     so dashboards can render either with one renderer."""
