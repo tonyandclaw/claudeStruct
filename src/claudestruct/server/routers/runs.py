@@ -13,11 +13,14 @@ response without creating a duplicate. Scoped per-org via the
 """
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import secrets
+from datetime import datetime
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -31,6 +34,8 @@ from claudestruct.server.schema import (
     CreateRunRequest,
     CreateRunResponse,
     RunDetail,
+    RunListResponse,
+    RunRow,
     TokenCapExceededResponse,
 )
 
@@ -187,9 +192,10 @@ def create_run(
     return CreateRunResponse(run_id=run_id, status="queued")
 
 
-def _row_to_detail(run: Run) -> RunDetail:
-    """Translate a DB Run row into the public RunDetail shape."""
-    return RunDetail(
+def _row_to_row(run: Run) -> RunRow:
+    """Translate a DB Run row into the dashboard's RunRow shape (shared
+    with `_row_to_detail` — RunDetail is currently a RunRow alias)."""
+    return RunRow(
         run_id=run.run_id,
         started_at=run.started_at.isoformat() if run.started_at else None,
         ended_at=run.ended_at.isoformat() if run.ended_at else None,
@@ -205,6 +211,117 @@ def _row_to_detail(run: Run) -> RunDetail:
         cost_usd=round(run.cost_usd, 6),
         cache_warnings=[run.error] if run.error else [],
     )
+
+
+# Cursor format: base64(`<created_at_iso>|<id>`). The `id` tie-breaker
+# is required because two rows can share `created_at` to the
+# microsecond on busy clusters; without it, pagination can either
+# skip rows or loop. Opaque so we can swap encodings without a
+# client-visible contract bump.
+def _encode_cursor(created_at: datetime, row_id: int) -> str:
+    raw = f"{created_at.isoformat()}|{row_id}".encode()
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def _decode_cursor(cursor: str) -> tuple[datetime, int]:
+    pad = "=" * (-len(cursor) % 4)
+    try:
+        raw = base64.urlsafe_b64decode(cursor + pad).decode()
+        ts_str, id_str = raw.rsplit("|", 1)
+        return datetime.fromisoformat(ts_str), int(id_str)
+    except (ValueError, UnicodeDecodeError, binascii.Error) as exc:
+        raise HTTPException(
+            status_code=400, detail=f"invalid cursor: {exc}",
+        ) from exc
+
+
+@router.get("", response_model=RunListResponse)
+def list_runs(
+    request: Request,
+    limit: int = Query(default=50, ge=1, le=200),
+    cursor: str | None = Query(default=None),
+    status_filter: str | None = Query(default=None, alias="status"),
+    task: str | None = Query(default=None),
+    principal: auth_mod.Principal = Depends(auth_mod.require_role(Role.viewer)),
+) -> RunListResponse:
+    """Tenant-scoped list of runs, newest first.
+
+    Pagination is cursor-based: the response carries `next_cursor`
+    when more rows exist; the caller passes it back unchanged on the
+    next request. We deliberately do not use offsets — an offset is
+    O(N) at the DB and silently skips rows when new ones land between
+    requests.
+
+    Filters are AND-combined:
+      - `status` — `queued`, `running`, `done`, or `failed`. Unknown
+        values 400 instead of returning the empty set, so a typo
+        surfaces immediately.
+      - `task` — `dev`, `review`, `plan`, `debug`. Same shape.
+
+    Tenant isolation: the `Run.org_id == principal.org_id` filter is
+    unconditional. The endpoint can never surface another org's runs
+    even if the caller crafts a cursor pointing at one — the cursor
+    is just an ordering anchor, not a bypass.
+    """
+    if status_filter is not None and status_filter not in {
+        s.value for s in RunStatus
+    }:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "invalid status; must be one of: "
+                f"{sorted(s.value for s in RunStatus)}"
+            ),
+        )
+    valid_tasks = {"dev", "review", "plan", "debug"}
+    if task is not None and task not in valid_tasks:
+        raise HTTPException(
+            status_code=400,
+            detail=f"invalid task; must be one of: {sorted(valid_tasks)}",
+        )
+
+    factory = request.app.state.session_factory
+    with factory() as session:
+        query = select(Run).where(Run.org_id == principal.org_id)
+        if status_filter is not None:
+            query = query.where(Run.status == status_filter)
+        if task is not None:
+            query = query.where(Run.task == task)
+        if cursor is not None:
+            cur_ts, cur_id = _decode_cursor(cursor)
+            # `(created_at, id) < (cur_ts, cur_id)` in lexical order =
+            # "strictly older than the last row of the previous page".
+            # Composed via OR rather than a row-value comparison so
+            # SQLite can use the (created_at, id) index path.
+            query = query.where(
+                (Run.created_at < cur_ts)
+                | ((Run.created_at == cur_ts) & (Run.id < cur_id))
+            )
+        # Fetch one extra so we know whether to emit a next_cursor
+        # without a separate COUNT(*) query.
+        rows = list(session.execute(
+            query.order_by(Run.created_at.desc(), Run.id.desc()).limit(limit + 1)
+        ).scalars())
+        has_more = len(rows) > limit
+        page = rows[:limit]
+        next_cursor = (
+            _encode_cursor(page[-1].created_at, page[-1].id)
+            if has_more and page else None
+        )
+        return RunListResponse(
+            runs=[_row_to_row(r) for r in page],
+            next_cursor=next_cursor,
+        )
+
+
+def _row_to_detail(run: Run) -> RunDetail:
+    """Translate a DB Run row into the public RunDetail shape.
+
+    RunDetail is currently a RunRow alias (same fields), so we delegate
+    to `_row_to_row` and rebuild the subclass from the dict. Keeps the
+    13-field mapping in one place.
+    """
+    return RunDetail.model_validate(_row_to_row(run).model_dump())
 
 
 @router.get("/{run_id}", response_model=RunDetail)

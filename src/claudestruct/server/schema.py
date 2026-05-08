@@ -223,6 +223,19 @@ class RunDetail(RunRow):
     pass
 
 
+class RunListResponse(BaseModel):
+    """Tenant-scoped page of runs from `GET /v1/runs`.
+
+    Cursor pagination: callers pass back `next_cursor` from the
+    previous page to fetch older rows. `next_cursor` is `None` when
+    the server has returned the last page. The cursor is opaque —
+    its encoding (currently base64 of ``<created_at_iso>|<id>``) may
+    change without a contract bump.
+    """
+    runs: list[RunRow]
+    next_cursor: Optional[str] = None
+
+
 # --- Audit log (W8.4) ----------------------------------------------
 
 class AuditHeadResponse(BaseModel):
