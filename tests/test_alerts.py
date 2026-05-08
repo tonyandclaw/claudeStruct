@@ -1007,3 +1007,150 @@ def test_team_budget_findings_dispatched_through_notifier(env, monkeypatch):
     n = alerts_mod.run_alert_pass(env["factory"], notifier)
     assert n == 1  # one team finding (the seeded data has no regression)
     assert notifier.calls[0].kind == "team_budget_burn"
+
+
+# --- SLO error-budget burn-rate alerts (A.2) ------------------------
+
+
+def _seed_burn_runs(
+    env,
+    *,
+    now: datetime,
+    total: int,
+    failed: int,
+    age_minutes: int,
+) -> None:
+    """Seed `total` runs landing `age_minutes` ago, of which `failed`
+    are in `failed` status. Used to drive the burn-rate detector."""
+    factory = env["factory"]
+    with factory() as session:
+        for i in range(total):
+            status = (
+                RunStatus.failed.value if i < failed
+                else RunStatus.done.value
+            )
+            _seed_run(
+                session,
+                org_id=env["acme_id"], user_id=env["ua_id"],
+                run_id=f"burn-{age_minutes}m-{i}", cost=0.1,
+                status=status,
+                created_at=now - timedelta(minutes=age_minutes),
+            )
+        session.commit()
+
+
+def test_burn_rate_no_findings_when_low_traffic(env, monkeypatch):
+    """Below `BURN_RATE_MIN_RUNS` the detector skips — at low traffic
+    a single failure dominates the rate and we'd just yell 100% burn
+    every cron tick."""
+    fake_now = datetime(2026, 4, 28, 12, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(alerts_mod, "_now_utc", lambda: fake_now)
+    # 5 runs, 2 failed (40% error) — should NOT alert because total < 10.
+    _seed_burn_runs(env, now=fake_now, total=5, failed=2, age_minutes=10)
+    with env["factory"]() as session:
+        findings = alerts_mod.compute_burn_rate_alerts(session, now=fake_now)
+    assert findings == []
+
+
+def test_burn_rate_no_findings_below_threshold(env, monkeypatch):
+    """20 runs in 1h with 0 failures → 0× burn → no finding."""
+    fake_now = datetime(2026, 4, 28, 12, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(alerts_mod, "_now_utc", lambda: fake_now)
+    _seed_burn_runs(env, now=fake_now, total=20, failed=0, age_minutes=10)
+    with env["factory"]() as session:
+        findings = alerts_mod.compute_burn_rate_alerts(session, now=fake_now)
+    assert findings == []
+
+
+def test_burn_rate_fast_burn_in_1h_window_critical(env, monkeypatch):
+    """100 runs in 1h, 5 failed (5% error rate) → 50× burn rate
+    → fires fast-burn (1h) finding with critical severity."""
+    fake_now = datetime(2026, 4, 28, 12, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(alerts_mod, "_now_utc", lambda: fake_now)
+    _seed_burn_runs(env, now=fake_now, total=100, failed=5, age_minutes=15)
+    with env["factory"]() as session:
+        findings = alerts_mod.compute_burn_rate_alerts(session, now=fake_now)
+    # Both 1h and 6h windows fire (the data lives in both); the 1h
+    # finding must carry critical severity.
+    by_window = {f.window: f for f in findings}
+    assert "1h" in by_window
+    fast = by_window["1h"]
+    assert fast.failed == 5
+    assert fast.total_runs == 100
+    assert fast.error_rate == pytest.approx(0.05)
+    # 0.05 / 0.001 = 50× burn rate.
+    assert fast.burn_rate == pytest.approx(50.0)
+    alert = alerts_mod.burn_rate_finding_to_alert(fast)
+    assert alert.kind == "slo_error_budget_burn"
+    assert alert.severity == "critical"
+
+
+def test_burn_rate_slow_burn_in_6h_window_warning(env, monkeypatch):
+    """500 runs in the 6h window with 5 failed (1% error rate)
+    → 10× burn → fires the 6h slow-burn finding (warning) but
+    NOT the 1h fast-burn (only ~83 runs land in the 1h window)."""
+    fake_now = datetime(2026, 4, 28, 12, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(alerts_mod, "_now_utc", lambda: fake_now)
+    # Seed runs spread across 6h; only 1 failure in the most-recent
+    # 1h slice → 1h burn rate too low to fire fast-burn.
+    _seed_burn_runs(
+        env, now=fake_now, total=400, failed=4, age_minutes=120,
+    )
+    with env["factory"]() as session:
+        findings = alerts_mod.compute_burn_rate_alerts(session, now=fake_now)
+    by_window = {f.window: f for f in findings}
+    # 1h window — runs landed 120 min ago, so the 1h window is empty;
+    # no fast-burn finding for this org.
+    assert "1h" not in by_window
+    assert "6h" in by_window
+    slow = by_window["6h"]
+    assert slow.total_runs == 400
+    assert slow.failed == 4
+    assert slow.error_rate == pytest.approx(0.01)
+    # 0.01 / 0.001 = 10× burn rate; ≥ SLOW_BURN_THRESHOLD (6×).
+    assert slow.burn_rate == pytest.approx(10.0)
+    alert = alerts_mod.burn_rate_finding_to_alert(slow)
+    assert alert.severity == "warning"
+
+
+def test_burn_rate_findings_sorted_highest_first(env, monkeypatch):
+    """When both 1h and 6h fire, they're sorted by burn_rate desc."""
+    fake_now = datetime(2026, 4, 28, 12, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(alerts_mod, "_now_utc", lambda: fake_now)
+    _seed_burn_runs(env, now=fake_now, total=100, failed=10, age_minutes=15)
+    with env["factory"]() as session:
+        findings = alerts_mod.compute_burn_rate_alerts(session, now=fake_now)
+    assert len(findings) == 2
+    assert findings[0].burn_rate >= findings[1].burn_rate
+
+
+def test_burn_rate_summary_includes_window_and_rate(env, monkeypatch):
+    """The Slack/email body should let an operator triage without
+    drilling into the JSON details."""
+    fake_now = datetime(2026, 4, 28, 12, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(alerts_mod, "_now_utc", lambda: fake_now)
+    _seed_burn_runs(env, now=fake_now, total=50, failed=5, age_minutes=15)
+    with env["factory"]() as session:
+        findings = alerts_mod.compute_burn_rate_alerts(session, now=fake_now)
+    alert = alerts_mod.burn_rate_finding_to_alert(findings[0])
+    assert "acme" in alert.summary
+    assert "1h" in alert.summary
+    assert "100.0×" in alert.summary or "100.0x" in alert.summary or "100×" in alert.summary
+    # Severity and rate must round-trip in the structured details too.
+    assert alert.details["window"] == "1h"
+    assert alert.details["burn_rate"] == 100.0
+
+
+def test_burn_rate_findings_dispatched_through_notifier(env, monkeypatch):
+    """End-to-end: run_alert_pass dispatches all three detector kinds
+    (cost-regression, team-budget, burn-rate) through a single
+    notifier so the daemon handles them as one stream."""
+    fake_now = datetime(2026, 4, 28, 12, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(alerts_mod, "_now_utc", lambda: fake_now)
+    _seed_burn_runs(env, now=fake_now, total=50, failed=10, age_minutes=15)
+
+    notifier = _CapturingNotifier()
+    n = alerts_mod.run_alert_pass(env["factory"], notifier)
+    assert n >= 1
+    kinds = {c.kind for c in notifier.calls}
+    assert "slo_error_budget_burn" in kinds
