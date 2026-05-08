@@ -13,6 +13,26 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Production-readiness — fail the workflow on any committed
+  # secret. gitleaks runs first because it's the cheapest gate
+  # and the consequences of leaking a credential are 1000× worse
+  # than any test failure. `--no-git` keeps the run reproducible
+  # in PR mode (don't depend on remote history).
+  secret-scan:
+    name: Secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Need full history so gitleaks can scan every commit
+          # the PR introduces (default fetch-depth=1 only sees
+          # the merge commit).
+          fetch-depth: 0
+      - name: Run gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
   python:
     name: Python ${{ matrix.python-version }}
     runs-on: ubuntu-latest
