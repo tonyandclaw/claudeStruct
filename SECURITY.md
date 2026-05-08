@@ -51,3 +51,12 @@ security report.
 
 We patch security issues on the latest minor release line. Older lines may
 receive backports on a best-effort basis.
+
+## Threat model
+
+For the technical breakdown of trust boundaries, STRIDE per surface,
+tenant-isolation rules, and accepted risks, see
+[`docs/threat-model.md`](docs/threat-model.md). A PR that violates a
+documented invariant in that doc is a security defect; a PR that lands
+in a stated "out of scope" lane is not (but might still be a useful
+hardening).
