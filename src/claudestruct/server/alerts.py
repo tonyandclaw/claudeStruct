@@ -24,7 +24,10 @@ Edge cases:
 """
 from __future__ import annotations
 
+import logging
 import math
+import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
@@ -33,6 +36,8 @@ from sqlalchemy.orm import Session
 
 from claudestruct.server.models import Org, Run, RunStatus
 from claudestruct.server.notify import Alert, Notifier
+
+log = logging.getLogger("claudestruct.alerts")
 
 DEFAULT_SIGMA = 2.0
 DEFAULT_LOOKBACK_DAYS = 30
@@ -206,3 +211,108 @@ def dispatch_findings(
         notifier.notify(finding_to_alert(f))
         count += 1
     return count
+
+
+def run_alert_pass(
+    session_factory: Callable[[], Session],
+    notifier: Notifier,
+    *,
+    sigma: float = DEFAULT_SIGMA,
+    lookback_days: int = DEFAULT_LOOKBACK_DAYS,
+    check_recent_hours: int = DEFAULT_CHECK_RECENT_HOURS,
+) -> int:
+    """Single compute → dispatch pass. Used by both the one-shot
+    `cs serve alerts` command and the long-running scheduler.
+
+    Each pass opens its own session so we don't hold a transaction
+    across the (potentially slow) network call into the notifier.
+    """
+    with session_factory() as session:
+        findings = compute_cost_regression_alerts(
+            session,
+            sigma=sigma,
+            lookback_days=lookback_days,
+            check_recent_hours=check_recent_hours,
+        )
+    return dispatch_findings(findings, notifier)
+
+
+class AlertsScheduler:
+    """Long-running daemon thread that recomputes cost-regression
+    alerts on an interval (W6.5 follow-up).
+
+    Mirrors ``WorkerThread`` from ``server/worker.py``: a
+    ``threading.Event`` flag drives a loop that sleeps for
+    ``interval_s`` between passes; ``stop()`` wakes the sleep so
+    SIGINT/SIGTERM can shut down promptly without hard-killing an
+    in-flight notifier call.
+
+    The scheduler swallows per-pass exceptions and logs them — a
+    transient DB blip or a bad notifier reply must not take the
+    daemon down (cron would have just retried on the next tick;
+    the scheduler keeps the same behaviour).
+    """
+
+    def __init__(
+        self,
+        *,
+        session_factory: Callable[[], Session],
+        notifier: Notifier,
+        interval_s: float = 3600.0,
+        sigma: float = DEFAULT_SIGMA,
+        lookback_days: int = DEFAULT_LOOKBACK_DAYS,
+        check_recent_hours: int = DEFAULT_CHECK_RECENT_HOURS,
+    ) -> None:
+        if interval_s <= 0:
+            raise ValueError("interval_s must be positive")
+        self.session_factory = session_factory
+        self.notifier = notifier
+        self.interval_s = interval_s
+        self.sigma = sigma
+        self.lookback_days = lookback_days
+        self.check_recent_hours = check_recent_hours
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        # Pass counter — exposed for tests so they can wait_until_passed.
+        self.passes_completed = 0
+
+    def start(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop.clear()
+        t = threading.Thread(
+            target=self._loop,
+            name="claudestruct-alerts-scheduler",
+            daemon=True,
+        )
+        self._thread = t
+        t.start()
+
+    def stop(self, timeout: float | None = 30.0) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=timeout)
+
+    def run_once(self) -> int:
+        """Synchronous single pass — useful for the `--once` CLI mode
+        and as a hook tests can drive without spinning up a thread."""
+        try:
+            n = run_alert_pass(
+                self.session_factory,
+                self.notifier,
+                sigma=self.sigma,
+                lookback_days=self.lookback_days,
+                check_recent_hours=self.check_recent_hours,
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("alerts scheduler pass crashed")
+            return 0
+        finally:
+            self.passes_completed += 1
+        return n
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            self.run_once()
+            # Use the event's wait so stop() wakes us.
+            self._stop.wait(timeout=self.interval_s)
