@@ -15,7 +15,15 @@ from sqlalchemy import select
 
 from claudestruct import dashboard as dash_mod
 from claudestruct.server import auth as auth_mod
-from claudestruct.server.models import Org, Role, Run, RunStatus, User
+from claudestruct.server.models import (
+    Org,
+    Role,
+    Run,
+    RunStatus,
+    Team,
+    TeamMembership,
+    User,
+)
 from claudestruct.server.schema import (
     AuthorRollup,
     DashboardResponse,
@@ -85,6 +93,7 @@ def _run_to_row(r: Run) -> RunRow:
 def get_team_dashboard(
     request: Request,
     limit: int = 50,
+    team: str | None = None,
     principal: auth_mod.Principal = Depends(auth_mod.require_role(Role.viewer)),
 ) -> TeamDashboardResponse:
     """Org-scoped rollup of runs executed via the daemon (W6.5).
@@ -101,6 +110,12 @@ def get_team_dashboard(
     Only `done` and `failed` runs are counted in the rollups; `queued`
     and `running` rows skew the cost numbers and are visible via
     `recent` if the caller wants live status.
+
+    Pass `?team=<slug>` to scope the rollup to a single intra-org
+    team — the response then only counts runs whose author belongs
+    to that team. A team slug from a different org returns 404 (not
+    403) so the response can't be used to enumerate teams across
+    tenants.
     """
     if limit < 1 or limit > 500:
         raise HTTPException(status_code=400, detail="limit must be between 1 and 500")
@@ -115,14 +130,53 @@ def get_team_dashboard(
             # could have been deleted in flight. Treat as 404.
             raise HTTPException(status_code=404, detail="org not found")
 
+        # Optional team scope. Resolved up-front so the rest of the
+        # rollup logic stays a single straight-line read.
+        team_user_ids: set[int] | None = None
+        if team is not None:
+            team_row = session.execute(
+                select(Team).where(
+                    Team.org_id == org.id, Team.slug == team,
+                )
+            ).scalar_one_or_none()
+            if team_row is None:
+                # 404 (not 403) — a team that exists in another org
+                # must not be distinguishable from a team that doesn't
+                # exist at all. Otherwise the endpoint becomes a
+                # cross-tenant team-slug enumeration oracle.
+                raise HTTPException(status_code=404, detail="team not found")
+            team_user_ids = {
+                m.user_id for m in session.execute(
+                    select(TeamMembership).where(
+                        TeamMembership.team_id == team_row.id
+                    )
+                ).scalars()
+            }
+            if not team_user_ids:
+                # Empty team — short-circuit with an empty payload
+                # rather than running a `Run.user_id IN ()` query
+                # (some DBs choke on empty IN clauses).
+                return TeamDashboardResponse(
+                    org_id=org.id,
+                    org_slug=org.slug,
+                    total_runs=0,
+                    total_cost_usd=0.0,
+                    by_author=[],
+                    by_task=[],
+                    recent=[],
+                )
+
         # Materialise once: list[Run] keeps the rollup logic readable
         # and avoids three identical SQL filters. For a single org's
         # daily volume this fits comfortably in memory.
         terminal_states = (RunStatus.done.value, RunStatus.failed.value)
+        run_query = select(Run).where(
+            Run.org_id == org.id, Run.status.in_(terminal_states)
+        )
+        if team_user_ids is not None:
+            run_query = run_query.where(Run.user_id.in_(team_user_ids))
         runs: list[Run] = list(session.execute(
-            select(Run)
-            .where(Run.org_id == org.id, Run.status.in_(terminal_states))
-            .order_by(Run.created_at.desc())
+            run_query.order_by(Run.created_at.desc())
         ).scalars())
 
         # Author rollup — join through users so the leaderboard

@@ -35,6 +35,7 @@ from claudestruct.server.models import Org, Role
 from claudestruct.server.schema import (
     CheckoutRequest,
     CheckoutResponse,
+    InvoicePdfResponse,
     SubscriptionResponse,
     UsageResponse,
 )
@@ -139,6 +140,88 @@ def get_usage(
         cache_read_tokens=cache_r,
         cache_creation_tokens=cache_c,
         cost_usd=round(cost, 6),
+    )
+
+
+@router.get(
+    "/invoices/{invoice_id}/pdf",
+    response_model=InvoicePdfResponse,
+)
+def get_invoice_pdf(
+    invoice_id: str,
+    principal: auth_mod.Principal = Depends(auth_mod.require_role(Role.viewer)),
+    session: Session = Depends(auth_mod.get_session),
+) -> InvoicePdfResponse:
+    """Return a signed Stripe `invoice_pdf` URL for an invoice this
+    org owns.
+
+    Tenant isolation: the endpoint refuses to serve an invoice whose
+    Stripe customer doesn't match the caller's
+    `subscription.stripe_customer_id`. A cross-tenant invoice ID
+    must look identical to a non-existent one (404, not 403) so the
+    endpoint can't be turned into a customer-ID enumeration oracle.
+    """
+    if not billing_mod.stripe_sdk_available():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "Stripe SDK not installed; install with `pip install stripe` "
+                "to enable invoice PDF passthrough."
+            ),
+        )
+
+    sub = billing_mod.get_or_default(session, principal.org_id)
+    if not sub.stripe_customer_id:
+        # Org has never gone through Checkout; can't possibly own an
+        # invoice. 404 (not 403) keeps cross-tenant indistinguishable.
+        raise HTTPException(status_code=404, detail="invoice not found")
+
+    import stripe  # type: ignore
+
+    try:
+        invoice = stripe.Invoice.retrieve(invoice_id)
+    except stripe.InvalidRequestError as exc:  # type: ignore[attr-defined]
+        # Unknown ID, malformed ID, or already-deleted invoice all
+        # land here. Map to 404 so we don't leak which case it was.
+        raise HTTPException(status_code=404, detail="invoice not found") from exc
+    except stripe.StripeError as exc:  # type: ignore[attr-defined]
+        # Network blip / Stripe outage — surface the upstream
+        # condition rather than swallowing it as a 404.
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"upstream Stripe error: {exc}",
+        ) from exc
+
+    # Tenant check.
+    invoice_customer = (
+        invoice.get("customer") if isinstance(invoice, dict)
+        else getattr(invoice, "customer", None)
+    )
+    if invoice_customer != sub.stripe_customer_id:
+        raise HTTPException(status_code=404, detail="invoice not found")
+
+    pdf_url = (
+        invoice.get("invoice_pdf") if isinstance(invoice, dict)
+        else getattr(invoice, "invoice_pdf", None)
+    )
+    hosted_url = (
+        invoice.get("hosted_invoice_url") if isinstance(invoice, dict)
+        else getattr(invoice, "hosted_invoice_url", None)
+    )
+    if not pdf_url:
+        # Invoice exists but Stripe hasn't finalised the PDF yet
+        # (e.g. draft invoice, or a `void` finalised but PDF generation
+        # hasn't run). Surface as 409 so the frontend can retry later
+        # rather than redirect to a 404 page.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="invoice PDF not yet available; try again later",
+        )
+
+    return InvoicePdfResponse(
+        invoice_id=invoice_id,
+        invoice_pdf_url=pdf_url,
+        hosted_invoice_url=hosted_url,
     )
 
 

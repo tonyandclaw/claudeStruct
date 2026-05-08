@@ -7,9 +7,9 @@ Two providers:
 - ``SlackWebhookNotifier`` — POSTs an incoming-webhook payload to a
   Slack channel URL. Used by hosted deployments that have wired up a
   Slack workspace.
-
-A future ``EmailNotifier`` slots in via the same Protocol; the alert
-producers (``alerts.py``) only see ``Notifier``.
+- ``EmailNotifier`` — sends a plain-text email via SMTP+STARTTLS.
+  Useful where Slack isn't an option (regulated environments,
+  on-call rotations that page via email-to-SMS, etc.).
 
 Provider selection is env-driven so the ``cs serve alerts`` command
 doesn't grow N flags for N future channels:
@@ -17,6 +17,13 @@ doesn't grow N flags for N future channels:
     CLAUDESTRUCT_NOTIFY_PROVIDER=log                  (default)
     CLAUDESTRUCT_NOTIFY_PROVIDER=slack
         CLAUDESTRUCT_SLACK_WEBHOOK_URL=https://hooks.slack.com/...
+    CLAUDESTRUCT_NOTIFY_PROVIDER=email
+        CLAUDESTRUCT_EMAIL_SMTP_HOST=smtp.example.com
+        CLAUDESTRUCT_EMAIL_SMTP_PORT=587
+        CLAUDESTRUCT_EMAIL_SMTP_USERNAME=alerts@example.com
+        CLAUDESTRUCT_EMAIL_SMTP_PASSWORD=...
+        CLAUDESTRUCT_EMAIL_FROM=alerts@example.com
+        CLAUDESTRUCT_EMAIL_TO=oncall@example.com,sre@example.com
 
 Test seam: producers should call ``notifier.notify(alert)`` rather
 than constructing a provider directly so unit tests can swap in a
@@ -142,6 +149,119 @@ class SlackWebhookNotifier:
             )
 
 
+class EmailNotifier:
+    """Sends an alert as a plain-text email via SMTP+STARTTLS.
+
+    Designed for regulated / no-Slack environments. We use stdlib
+    ``smtplib`` (no extra dep) and the connection is short-lived: one
+    SMTP session per alert. STARTTLS is required — we deliberately
+    don't support unencrypted SMTP because alert bodies routinely
+    name orgs and quote details that a hosted deployment would not
+    want on the wire in plaintext.
+
+    Inject ``smtp_factory`` for tests. Production callers leave it
+    None and we lazy-construct a real ``smtplib.SMTP``.
+    """
+
+    name = "email"
+
+    def __init__(
+        self,
+        *,
+        smtp_host: str,
+        smtp_port: int,
+        username: str,
+        password: str,
+        from_addr: str,
+        to_addrs: list[str],
+        smtp_factory: Any | None = None,
+    ) -> None:
+        if not smtp_host:
+            raise ValueError("EmailNotifier requires smtp_host")
+        if not from_addr:
+            raise ValueError("EmailNotifier requires from_addr")
+        if not to_addrs:
+            raise ValueError("EmailNotifier requires at least one to_addr")
+        self._host = smtp_host
+        self._port = smtp_port
+        self._username = username
+        self._password = password
+        self._from = from_addr
+        self._to = to_addrs
+        self._smtp_factory = smtp_factory
+
+    def _open_smtp(self) -> Any:
+        if self._smtp_factory is not None:
+            return self._smtp_factory(self._host, self._port)
+        # Lazy-import: stdlib so no extra dep, but we still defer the
+        # import until an EmailNotifier is actually constructed.
+        import smtplib
+        return smtplib.SMTP(self._host, self._port, timeout=10.0)
+
+    def _build_message(self, alert: Alert) -> str:
+        # Plain-text RFC 5322 message. Keep it dependency-free: no
+        # MIMEMultipart, no HTML. Alert details serialise as one
+        # `key: value` line each.
+        from email.utils import formatdate
+
+        lines = [
+            f"From: {self._from}",
+            f"To: {', '.join(self._to)}",
+            f"Date: {formatdate(localtime=False)}",
+            f"Subject: [{alert.severity.upper()}] {alert.org_slug}: "
+            f"{alert.summary}",
+            "",
+            f"kind:     {alert.kind}",
+            f"severity: {alert.severity}",
+            f"org:      {alert.org_slug}",
+            f"summary:  {alert.summary}",
+            "",
+            "details:",
+        ]
+        for k, v in alert.details.items():
+            lines.append(f"  {k}: {v}")
+        return "\r\n".join(lines)
+
+    def notify(self, alert: Alert) -> None:
+        # Best-effort: an SMTP failure must not crash the producer.
+        try:
+            smtp = self._open_smtp()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("email notifier failed to open SMTP: %s", exc)
+            return
+        try:
+            try:
+                smtp.starttls()
+            except Exception:  # noqa: BLE001
+                # If the server doesn't support STARTTLS we abort
+                # rather than fall back to plaintext — see class
+                # docstring.
+                log.warning(
+                    "email notifier: server does not support STARTTLS; "
+                    "alert dropped"
+                )
+                return
+            if self._username:
+                try:
+                    smtp.login(self._username, self._password)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("email notifier: login failed: %s", exc)
+                    return
+            try:
+                smtp.sendmail(
+                    self._from, self._to, self._build_message(alert),
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning("email notifier: sendmail failed: %s", exc)
+        finally:
+            quit_ = getattr(smtp, "quit", None)
+            if callable(quit_):
+                try:
+                    quit_()
+                except Exception:  # noqa: BLE001
+                    pass
+
+
 # --- Factory --------------------------------------------------------
 
 
@@ -162,6 +282,40 @@ def default_notifier() -> Notifier:
                 "CLAUDESTRUCT_SLACK_WEBHOOK_URL to be set"
             )
         return SlackWebhookNotifier(url)
+    if name == "email":
+        host = os.environ.get("CLAUDESTRUCT_EMAIL_SMTP_HOST", "").strip()
+        port_raw = os.environ.get("CLAUDESTRUCT_EMAIL_SMTP_PORT", "587").strip()
+        from_addr = os.environ.get("CLAUDESTRUCT_EMAIL_FROM", "").strip()
+        to_raw = os.environ.get("CLAUDESTRUCT_EMAIL_TO", "").strip()
+        username = os.environ.get(
+            "CLAUDESTRUCT_EMAIL_SMTP_USERNAME", "",
+        ).strip()
+        password = os.environ.get(
+            "CLAUDESTRUCT_EMAIL_SMTP_PASSWORD", "",
+        )
+        if not host or not from_addr or not to_raw:
+            raise RuntimeError(
+                "CLAUDESTRUCT_NOTIFY_PROVIDER=email requires "
+                "CLAUDESTRUCT_EMAIL_SMTP_HOST, CLAUDESTRUCT_EMAIL_FROM, "
+                "and CLAUDESTRUCT_EMAIL_TO to be set"
+            )
+        try:
+            port = int(port_raw)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"CLAUDESTRUCT_EMAIL_SMTP_PORT={port_raw!r} is not an integer"
+            ) from exc
+        # `addr1,addr2` → ["addr1", "addr2"], whitespace-stripped.
+        to_addrs = [a.strip() for a in to_raw.split(",") if a.strip()]
+        return EmailNotifier(
+            smtp_host=host,
+            smtp_port=port,
+            username=username,
+            password=password,
+            from_addr=from_addr,
+            to_addrs=to_addrs,
+        )
     raise RuntimeError(
-        f"unknown CLAUDESTRUCT_NOTIFY_PROVIDER={name!r}; expected one of: log, slack"
+        f"unknown CLAUDESTRUCT_NOTIFY_PROVIDER={name!r}; "
+        f"expected one of: log, slack, email"
     )

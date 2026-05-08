@@ -26,7 +26,15 @@ from sqlalchemy.pool import StaticPool
 from claudestruct.server.app import create_app
 from claudestruct.server.auth import generate_key
 from claudestruct.server.db import init_db, make_session_factory
-from claudestruct.server.models import ApiKey, Membership, Org, Role, User
+from claudestruct.server.models import (
+    ApiKey,
+    Membership,
+    Org,
+    Role,
+    Team,
+    TeamMembership,
+    User,
+)
 
 
 @pytest.fixture()
@@ -639,6 +647,92 @@ def test_team_dashboard_limit_validation(env):
         "/v1/dashboard/team?limit=10000", headers=_auth(env["keys"]["viewer@a"]),
     )
     assert r.status_code == 400
+
+
+# --- Team-scoped dashboard (?team=<slug>) ---------------------------
+
+def _seed_team(env, *, org_slug: str, team_slug: str, member_emails: list[str]) -> None:
+    """Create a team in <org_slug> and add the given users to it."""
+    with env["factory"]() as session:
+        org = session.query(Org).filter_by(slug=org_slug).one()
+        team = Team(org_id=org.id, slug=team_slug, name=team_slug.upper())
+        session.add(team)
+        session.flush()
+        for email in member_emails:
+            user = session.query(User).filter_by(email=email).one()
+            session.add(TeamMembership(team_id=team.id, user_id=user.id))
+        session.commit()
+
+
+def test_team_dashboard_team_filter_scopes_to_team_members(env):
+    """?team=<slug> only counts runs whose author is on that team."""
+    from claudestruct.server.worker import drain_queue
+
+    _seed_team(env, org_slug="org-a", team_slug="platform",
+               member_emails=["member@a"])
+
+    # member@a is on platform; admin@a is not.
+    _post_run(env, "member@a", task="dev", description="platform run")
+    _post_run(env, "admin@a", task="review", description="non-platform run")
+    drain_queue(env["factory"], env["tmp_path"], runner=_stub_runner)
+
+    # Without filter: both runs visible.
+    r_all = env["client"].get(
+        "/v1/dashboard/team", headers=_auth(env["keys"]["viewer@a"]),
+    ).json()
+    assert r_all["total_runs"] == 2
+
+    # With ?team=platform: only member@a's run.
+    r_filtered = env["client"].get(
+        "/v1/dashboard/team?team=platform",
+        headers=_auth(env["keys"]["viewer@a"]),
+    ).json()
+    assert r_filtered["total_runs"] == 1
+    assert {a["email"] for a in r_filtered["by_author"]} == {"member@a"}
+
+
+def test_team_dashboard_team_filter_unknown_slug_404(env):
+    """A team slug that doesn't exist in the caller's org → 404."""
+    r = env["client"].get(
+        "/v1/dashboard/team?team=does-not-exist",
+        headers=_auth(env["keys"]["viewer@a"]),
+    )
+    assert r.status_code == 404
+    assert r.json()["detail"] == "team not found"
+
+
+def test_team_dashboard_team_filter_cross_org_404_not_403(env):
+    """A team that exists in a *different* org must look identical to a
+    non-existent team — otherwise the endpoint becomes a cross-tenant
+    team-slug enumeration oracle."""
+    # Create `growth` in org-b only.
+    _seed_team(env, org_slug="org-b", team_slug="growth", member_emails=["admin@b"])
+
+    # viewer@a (in org-a) asks for ?team=growth — must be indistinguishable
+    # from a slug that doesn't exist anywhere.
+    r = env["client"].get(
+        "/v1/dashboard/team?team=growth",
+        headers=_auth(env["keys"]["viewer@a"]),
+    )
+    assert r.status_code == 404
+    assert r.json()["detail"] == "team not found"
+
+
+def test_team_dashboard_team_filter_empty_team_returns_zero_rollup(env):
+    """A team with no members (e.g. just-created, or all members
+    removed) should return empty rollup, not 500 from a `IN ()`
+    SQL query."""
+    _seed_team(env, org_slug="org-a", team_slug="empty-team", member_emails=[])
+
+    r = env["client"].get(
+        "/v1/dashboard/team?team=empty-team",
+        headers=_auth(env["keys"]["viewer@a"]),
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["total_runs"] == 0
+    assert body["by_author"] == []
+    assert body["recent"] == []
 
 
 # --- W6.6 GitHub App webhook --------------------------------------------

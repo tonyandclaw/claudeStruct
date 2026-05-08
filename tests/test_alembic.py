@@ -91,43 +91,68 @@ def test_versions_directory_exists():
     assert versions.is_dir()
 
 
-def test_no_migrations_yet(script):
-    """With no migration files, script.walk_revisions('head', 'base')
-    returns the empty chain (no revisions to apply)."""
-    # When there are no migrations, alembic's current == head == base.
-    # Walk from base (empty DB) forward — if there are no revisions,
-    # the iterator is empty.
-    revs = list(script.walk_revisions("head", "base"))
-    # At least one "initial" migration would be expected once we add a
-    # real schema-change migration. This assertion documents the
-    # current empty-state.
-    # If the next developer adds a migration file this test still passes
-    # (because we have ≥0 revisions); what it guards against is a
-    # completely broken alembic setup.
-    assert isinstance(revs, list)
-
-
-# NOTE: The migrate_head_on_fresh_db and migrate_head_idempotent tests
-# are deferred. Alembic's EnvironmentContext.configure must be invoked
-# inside a migration transaction (not as a bare top-level call), which
-# requires the full alembic.runtime.environment machinery. The simpler
-# tests above already verify that:
-# - alembic.ini is loadable
-# - env.py is syntactically valid
-# - the versions/ directory exists
-# - the script directory is traversable (walk_revisions)
-# These are sufficient to validate the scaffolding. The migration
-# integration is exercised end-to-end when `cs serve migrate` runs
-# against a real DB, and a future first-schema-change migration will
-# provide the concrete migration file needed for fuller testing.
-
-
-def test_current_command_shows_no_revisions_when_empty(script):
-    """alembic current returns empty string when no revisions applied."""
-    # No DB involved — just check the script directory is traversable.
+def test_baseline_migration_is_present(script):
+    """The seeded baseline migration is the one and only head."""
     heads = script.get_heads()
-    # Empty versions dir → no head revisions.
-    assert heads == []
+    assert len(heads) == 1, (
+        f"Expected exactly one head revision (the baseline); "
+        f"found {len(heads)}: {heads}"
+    )
+
+
+def test_baseline_migration_has_no_parent(script):
+    """The baseline migration is the chain root (down_revision is None)."""
+    head_id = script.get_heads()[0]
+    head_rev = script.get_revision(head_id)
+    assert head_rev.down_revision is None, (
+        "Baseline migration must have down_revision=None so "
+        "`alembic upgrade head` works on a fresh DB."
+    )
+
+
+def test_baseline_migration_creates_all_model_tables(tmp_path):
+    """`alembic upgrade head` on a fresh DB creates every table the ORM knows
+    about. This catches the case where someone adds a SQLAlchemy model but
+    forgets to run `alembic revision --autogenerate`."""
+    from alembic.config import Config as AlembicConfig
+
+    from alembic import command
+
+    db_path = tmp_path / "alembic_smoke.db"
+    db_url = f"sqlite:///{db_path}"
+
+    root = Path(__file__).parent.parent
+    cfg = AlembicConfig(str(root / "alembic.ini"))
+    cfg.set_main_option("script_location", str(root / "alembic"))
+    # Override DATABASE_URL via env so env.py picks it up.
+    import os as _os
+    _prev = _os.environ.get("DATABASE_URL")
+    _os.environ["DATABASE_URL"] = db_url
+    try:
+        command.upgrade(cfg, "head")
+    finally:
+        if _prev is None:
+            _os.environ.pop("DATABASE_URL", None)
+        else:
+            _os.environ["DATABASE_URL"] = _prev
+
+    # Compare migration-created tables vs the ORM metadata.
+    from sqlalchemy import create_engine, inspect
+
+    engine = create_engine(db_url)
+    inspector = inspect(engine)
+    migration_tables = set(inspector.get_table_names())
+
+    expected_tables = set(Base.metadata.tables.keys())
+    # alembic_version is created by alembic itself; not in ORM metadata.
+    expected_with_alembic = expected_tables | {"alembic_version"}
+
+    missing = expected_with_alembic - migration_tables
+    assert not missing, (
+        f"Migration is missing tables that exist in Base.metadata: {missing}. "
+        f"Did you add a new model without regenerating the migration? "
+        f"Run `alembic revision --autogenerate -m 'add X'` to fix."
+    )
 
 
 def test_alembic_api_importable():

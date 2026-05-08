@@ -41,8 +41,12 @@ from claudestruct.server import models  # noqa: F401
 config = context.config
 
 # Interpret the config file for Python logging.
+# disable_existing_loggers=False so we don't silence loggers (e.g.
+# claudestruct.notify) that were already configured before alembic ran —
+# important when env.py is invoked from inside a test or a long-running
+# server process that has its own logging set up.
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 target_metadata = Base.metadata
 

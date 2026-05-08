@@ -283,3 +283,61 @@ def test_effort_flag_threads_through_to_run_task(
     )
     assert result.exit_code == 0, _stderr(result)
     assert seen_effort == ["xhigh"]
+
+
+# --- --llm-cache / --no-llm-cache CLI flag plumbing (W9.4) ----------
+
+
+def _capture_llm_cache(monkeypatch, tmp_path) -> dict:
+    """Helper: run a `cs review` and return what value of `llm_cache`
+    reached `runner.run_task`. Used by the three flag-mode tests below."""
+    seen: dict = {}
+
+    def fake_run_task(task, user_message, **kw):
+        seen["llm_cache"] = kw.get("llm_cache", "<unset>")
+        return _make_result()
+
+    monkeypatch.setattr("claudestruct.runner.run_task", fake_run_task)
+    return seen
+
+
+def test_cli_flag_llm_cache_on_threads_to_runner(monkeypatch, tmp_path):
+    """`cs review --llm-cache <desc>` must flow `llm_cache="on"` all
+    the way down to runner.run_task."""
+    seen = _capture_llm_cache(monkeypatch, tmp_path)
+
+    result = _runner().invoke(
+        cli_mod.main,
+        ["review", "--root", str(tmp_path), "--llm-cache", "check the diff"],
+    )
+    assert result.exit_code == 0, _stderr(result)
+    assert seen["llm_cache"] == "on"
+
+
+def test_cli_flag_no_llm_cache_threads_to_runner(monkeypatch, tmp_path):
+    """`--no-llm-cache` must surface as `llm_cache="off"` so the
+    runner can override an env-driven default."""
+    seen = _capture_llm_cache(monkeypatch, tmp_path)
+
+    result = _runner().invoke(
+        cli_mod.main,
+        ["review", "--root", str(tmp_path), "--no-llm-cache", "check the diff"],
+    )
+    assert result.exit_code == 0, _stderr(result)
+    assert seen["llm_cache"] == "off"
+
+
+def test_cli_default_llm_cache_is_none_so_env_policy_applies(
+    monkeypatch, tmp_path,
+):
+    """No flag set → llm_cache=None reaches the runner so the
+    env-driven `auto` policy stays in charge (off for anthropic,
+    on for openai-compat)."""
+    seen = _capture_llm_cache(monkeypatch, tmp_path)
+
+    result = _runner().invoke(
+        cli_mod.main,
+        ["review", "--root", str(tmp_path), "check the diff"],
+    )
+    assert result.exit_code == 0, _stderr(result)
+    assert seen["llm_cache"] is None

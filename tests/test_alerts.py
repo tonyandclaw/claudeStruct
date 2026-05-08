@@ -493,3 +493,312 @@ def test_default_notifier_unknown_provider_raises(monkeypatch):
     monkeypatch.setenv("CLAUDESTRUCT_NOTIFY_PROVIDER", "carrier-pigeon")
     with pytest.raises(RuntimeError, match="unknown"):
         notify_mod.default_notifier()
+
+
+# --- EmailNotifier --------------------------------------------------
+
+
+class _FakeSMTP:
+    """Records calls; mimics the subset of smtplib.SMTP that
+    EmailNotifier exercises."""
+
+    def __init__(
+        self,
+        *,
+        starttls_raises: bool = False,
+        login_raises: bool = False,
+        sendmail_raises: bool = False,
+    ) -> None:
+        self.starttls_raises = starttls_raises
+        self.login_raises = login_raises
+        self.sendmail_raises = sendmail_raises
+        self.calls: list[tuple[str, tuple, dict]] = []
+        self.starttls_called = False
+        self.login_args: tuple | None = None
+        self.sendmail_args: tuple | None = None
+        self.quit_called = False
+
+    def starttls(self):
+        self.starttls_called = True
+        if self.starttls_raises:
+            raise RuntimeError("STARTTLS not supported")
+
+    def login(self, username, password):
+        self.login_args = (username, password)
+        if self.login_raises:
+            raise RuntimeError("login failed")
+
+    def sendmail(self, from_addr, to_addrs, msg):
+        self.sendmail_args = (from_addr, to_addrs, msg)
+        if self.sendmail_raises:
+            raise RuntimeError("sendmail failed")
+
+    def quit(self):
+        self.quit_called = True
+
+
+def _make_email_notifier(
+    smtp: _FakeSMTP,
+    *,
+    username: str = "alerts@example.com",
+    to_addrs: list[str] | None = None,
+):
+    return notify_mod.EmailNotifier(
+        smtp_host="smtp.example.com",
+        smtp_port=587,
+        username=username,
+        password="hunter2",
+        from_addr="alerts@example.com",
+        to_addrs=to_addrs or ["oncall@example.com"],
+        smtp_factory=lambda host, port: smtp,
+    )
+
+
+def _email_alert(severity: str = "warning") -> notify_mod.Alert:
+    return notify_mod.Alert(
+        kind="cost_regression",
+        severity=severity,
+        org_slug="acme",
+        summary="run cost spiked 3x",
+        details={"run_id": "abc", "cost_usd": 12.5},
+    )
+
+
+def test_email_notifier_rejects_empty_host():
+    with pytest.raises(ValueError, match="smtp_host"):
+        notify_mod.EmailNotifier(
+            smtp_host="", smtp_port=25, username="", password="",
+            from_addr="x@y", to_addrs=["a@b"],
+        )
+
+
+def test_email_notifier_rejects_empty_to_addrs():
+    with pytest.raises(ValueError, match="to_addr"):
+        notify_mod.EmailNotifier(
+            smtp_host="smtp", smtp_port=25, username="", password="",
+            from_addr="x@y", to_addrs=[],
+        )
+
+
+def test_email_notifier_rejects_empty_from():
+    with pytest.raises(ValueError, match="from_addr"):
+        notify_mod.EmailNotifier(
+            smtp_host="smtp", smtp_port=25, username="", password="",
+            from_addr="", to_addrs=["a@b"],
+        )
+
+
+def test_email_notifier_happy_path_sends_message():
+    smtp = _FakeSMTP()
+    n = _make_email_notifier(smtp)
+    n.notify(_email_alert("warning"))
+
+    assert smtp.starttls_called
+    assert smtp.login_args == ("alerts@example.com", "hunter2")
+    assert smtp.sendmail_args is not None
+    from_addr, to_addrs, msg = smtp.sendmail_args
+    assert from_addr == "alerts@example.com"
+    assert to_addrs == ["oncall@example.com"]
+    # Subject includes severity + org + summary.
+    assert "Subject: [WARNING] acme: run cost spiked 3x" in msg
+    # Body lists each detail key.
+    assert "run_id: abc" in msg
+    assert "cost_usd: 12.5" in msg
+    assert smtp.quit_called
+
+
+def test_email_notifier_skips_login_when_no_username():
+    smtp = _FakeSMTP()
+    n = _make_email_notifier(smtp, username="")
+    n.notify(_email_alert())
+    # login was not called (no creds) but mail still sent.
+    assert smtp.login_args is None
+    assert smtp.sendmail_args is not None
+
+
+def test_email_notifier_drops_alert_if_starttls_unsupported(caplog):
+    smtp = _FakeSMTP(starttls_raises=True)
+    n = _make_email_notifier(smtp)
+    with caplog.at_level("WARNING", logger="claudestruct.notify"):
+        n.notify(_email_alert())
+    # Did not attempt to login or send over plaintext.
+    assert smtp.login_args is None
+    assert smtp.sendmail_args is None
+    assert any("STARTTLS" in r.message for r in caplog.records)
+
+
+def test_email_notifier_swallows_sendmail_failure(caplog):
+    smtp = _FakeSMTP(sendmail_raises=True)
+    n = _make_email_notifier(smtp)
+    with caplog.at_level("WARNING", logger="claudestruct.notify"):
+        n.notify(_email_alert())  # must not raise
+    assert any("sendmail failed" in r.message for r in caplog.records)
+
+
+def test_default_notifier_returns_email_when_configured(monkeypatch):
+    monkeypatch.setenv("CLAUDESTRUCT_NOTIFY_PROVIDER", "email")
+    monkeypatch.setenv("CLAUDESTRUCT_EMAIL_SMTP_HOST", "smtp.example.com")
+    monkeypatch.setenv("CLAUDESTRUCT_EMAIL_SMTP_PORT", "587")
+    monkeypatch.setenv("CLAUDESTRUCT_EMAIL_FROM", "alerts@example.com")
+    monkeypatch.setenv(
+        "CLAUDESTRUCT_EMAIL_TO", "oncall@example.com,sre@example.com",
+    )
+    monkeypatch.setenv("CLAUDESTRUCT_EMAIL_SMTP_USERNAME", "alerts@example.com")
+    monkeypatch.setenv("CLAUDESTRUCT_EMAIL_SMTP_PASSWORD", "hunter2")
+
+    n = notify_mod.default_notifier()
+    assert n.name == "email"
+    assert n._to == ["oncall@example.com", "sre@example.com"]
+
+
+def test_default_notifier_email_missing_required_env_raises(monkeypatch):
+    monkeypatch.setenv("CLAUDESTRUCT_NOTIFY_PROVIDER", "email")
+    monkeypatch.delenv("CLAUDESTRUCT_EMAIL_SMTP_HOST", raising=False)
+    with pytest.raises(RuntimeError, match="CLAUDESTRUCT_EMAIL_SMTP_HOST"):
+        notify_mod.default_notifier()
+
+
+def test_default_notifier_email_invalid_port_raises(monkeypatch):
+    monkeypatch.setenv("CLAUDESTRUCT_NOTIFY_PROVIDER", "email")
+    monkeypatch.setenv("CLAUDESTRUCT_EMAIL_SMTP_HOST", "smtp.example.com")
+    monkeypatch.setenv("CLAUDESTRUCT_EMAIL_SMTP_PORT", "not-a-number")
+    monkeypatch.setenv("CLAUDESTRUCT_EMAIL_FROM", "alerts@example.com")
+    monkeypatch.setenv("CLAUDESTRUCT_EMAIL_TO", "oncall@example.com")
+    with pytest.raises(RuntimeError, match="not an integer"):
+        notify_mod.default_notifier()
+
+
+# --- AlertsScheduler (long-running daemon) --------------------------
+
+
+def _seed_regression(env, *, now=None):
+    """Seed the acme org with a baseline + one obviously-regressing run
+    so a `compute_cost_regression_alerts` pass produces exactly one
+    finding."""
+    from datetime import datetime as _dt
+    if now is None:
+        now = _dt(2026, 4, 28, 12, 0, tzinfo=timezone.utc)
+    factory = env["factory"]
+    with factory() as session:
+        # 5 cheap baseline runs — gives a clear mean ≈ 1.0 with stddev ≈ 0.
+        for i in range(5):
+            _seed_run(
+                session,
+                org_id=env["acme_id"], user_id=env["ua_id"],
+                run_id=f"baseline-{i}", cost=1.0,
+                created_at=now - timedelta(days=2),
+            )
+        # One recent run that costs 100x baseline → blows past 2σ.
+        _seed_run(
+            session,
+            org_id=env["acme_id"], user_id=env["ua_id"],
+            run_id="spike", cost=100.0,
+            created_at=now - timedelta(hours=1),
+        )
+        session.commit()
+    return now
+
+
+def test_scheduler_rejects_non_positive_interval(env):
+    with pytest.raises(ValueError, match="interval_s"):
+        alerts_mod.AlertsScheduler(
+            session_factory=env["factory"],
+            notifier=_CapturingNotifier(),
+            interval_s=0,
+        )
+
+
+def test_scheduler_run_once_dispatches_findings(env, monkeypatch):
+    """run_once executes a full pass and counts in passes_completed."""
+    # Pin "now" so the seeded recent run lands inside check_recent_hours.
+    fake_now = _seed_regression(env)
+    monkeypatch.setattr(alerts_mod, "_now_utc", lambda: fake_now)
+
+    notifier = _CapturingNotifier()
+    sched = alerts_mod.AlertsScheduler(
+        session_factory=env["factory"],
+        notifier=notifier,
+        interval_s=60.0,
+    )
+    n = sched.run_once()
+    assert n == 1
+    assert sched.passes_completed == 1
+    assert len(notifier.calls) == 1
+    assert notifier.calls[0].kind == "cost_regression"
+
+
+def test_scheduler_run_once_swallows_pass_exceptions():
+    """A crash inside the pass increments passes_completed but doesn't
+    propagate — the daemon must keep running across transient failures."""
+    class _ExplodingFactory:
+        def __call__(self):
+            raise RuntimeError("simulated DB blip")
+
+    sched = alerts_mod.AlertsScheduler(
+        session_factory=_ExplodingFactory(),
+        notifier=_CapturingNotifier(),
+        interval_s=60.0,
+    )
+    # No raise.
+    n = sched.run_once()
+    assert n == 0
+    assert sched.passes_completed == 1
+
+
+def test_scheduler_thread_lifecycle(env, monkeypatch):
+    """start() spawns a daemon thread that runs at least one pass;
+    stop() joins it cleanly within the timeout."""
+    import time
+
+    fake_now = _seed_regression(env)
+    monkeypatch.setattr(alerts_mod, "_now_utc", lambda: fake_now)
+
+    notifier = _CapturingNotifier()
+    sched = alerts_mod.AlertsScheduler(
+        session_factory=env["factory"],
+        notifier=notifier,
+        # Very short interval so the test doesn't drag.
+        interval_s=0.05,
+    )
+    sched.start()
+    # Wait until at least one pass has happened — the loop calls
+    # run_once before the first sleep so this should be near-instant.
+    deadline = time.monotonic() + 5.0
+    while sched.passes_completed < 1 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert sched.passes_completed >= 1
+    assert len(notifier.calls) >= 1
+
+    sched.stop(timeout=2.0)
+    # Thread must be done.
+    assert sched._thread is not None
+    assert not sched._thread.is_alive()
+
+
+def test_scheduler_double_start_is_idempotent(env, monkeypatch):
+    """Calling start() twice doesn't spawn a second thread."""
+    monkeypatch.setattr(
+        alerts_mod, "_now_utc",
+        lambda: datetime(2026, 4, 28, 12, 0, tzinfo=timezone.utc),
+    )
+    sched = alerts_mod.AlertsScheduler(
+        session_factory=env["factory"],
+        notifier=_CapturingNotifier(),
+        interval_s=10.0,
+    )
+    sched.start()
+    first_thread = sched._thread
+    sched.start()  # No-op on already-running scheduler.
+    assert sched._thread is first_thread
+    sched.stop(timeout=2.0)
+
+
+def test_run_alert_pass_helper_returns_dispatched_count(env, monkeypatch):
+    """The shared helper that both --once and --watch use."""
+    fake_now = _seed_regression(env)
+    monkeypatch.setattr(alerts_mod, "_now_utc", lambda: fake_now)
+
+    notifier = _CapturingNotifier()
+    n = alerts_mod.run_alert_pass(env["factory"], notifier)
+    assert n == 1
+    assert len(notifier.calls) == 1

@@ -451,21 +451,27 @@ def serve_worker(db_url: str | None, run_root: str, once: bool,
               help="Baseline window for the mean+stddev calculation.")
 @click.option("--check-recent-hours", type=int, default=24, show_default=True,
               help="Window of recent runs to evaluate against the baseline.")
+@click.option("--watch", is_flag=True, default=False,
+              help="Run as a long-running daemon, recomputing every "
+                   "--interval seconds. Default is one pass and exit.")
+@click.option("--interval", type=float, default=3600.0, show_default=True,
+              help="Interval between passes when --watch is set, in seconds.")
 def serve_alerts(db_url: str | None, sigma: float, lookback_days: int,
-                 check_recent_hours: int) -> None:
+                 check_recent_hours: int, watch: bool, interval: float) -> None:
     """Compute cost-regression alerts and dispatch via the notifier (W6.5).
 
     Provider is picked via ``CLAUDESTRUCT_NOTIFY_PROVIDER`` (``log`` by
     default; set to ``slack`` + ``CLAUDESTRUCT_SLACK_WEBHOOK_URL`` for
-    Slack delivery). Findings flag runs whose cost is more than
-    ``--sigma`` standard deviations above their org's 30-day mean
-    successful-run cost. Run from cron / a Kubernetes CronJob.
+    Slack delivery, or ``email`` + the SMTP env vars for email).
+    Findings flag runs whose cost is more than ``--sigma`` standard
+    deviations above their org's 30-day mean successful-run cost.
+
+    Default mode is one pass and exit, suitable for cron / Kubernetes
+    CronJob. Pass ``--watch --interval 1800`` to run as a long-running
+    daemon (Ctrl-C exits gracefully at the next interval boundary).
     """
     _ensure_server_deps()
-    from claudestruct.server.alerts import (
-        compute_cost_regression_alerts,
-        dispatch_findings,
-    )
+    from claudestruct.server.alerts import AlertsScheduler, run_alert_pass
     from claudestruct.server.db import init_db, make_engine, make_session_factory
     from claudestruct.server.notify import default_notifier
 
@@ -480,15 +486,45 @@ def serve_alerts(db_url: str | None, sigma: float, lookback_days: int,
         # (cron job alerting on its own setup), not a silent skip.
         raise click.ClickException(str(exc)) from exc
 
-    with factory() as session:
-        findings = compute_cost_regression_alerts(
-            session,
+    if not watch:
+        n = run_alert_pass(
+            factory, notifier,
             sigma=sigma,
             lookback_days=lookback_days,
             check_recent_hours=check_recent_hours,
         )
-        n = dispatch_findings(findings, notifier)
-    click.echo(f"alerts: {n} dispatched via {notifier.name}")
+        click.echo(f"alerts: {n} dispatched via {notifier.name}")
+        return
+
+    # Daemon mode.
+    scheduler = AlertsScheduler(
+        session_factory=factory,
+        notifier=notifier,
+        interval_s=interval,
+        sigma=sigma,
+        lookback_days=lookback_days,
+        check_recent_hours=check_recent_hours,
+    )
+    click.echo(
+        f"alerts daemon: interval={interval}s, notifier={notifier.name}, "
+        f"sigma={sigma}, lookback_days={lookback_days}. Ctrl-C to stop."
+    )
+    scheduler.start()
+    try:
+        # Block the main thread until SIGINT — the scheduler thread
+        # is a daemon, so we own the lifetime here.
+        while True:
+            try:
+                # Sleep in 1s slices so Ctrl-C lands promptly on
+                # platforms (Windows) where Event.wait blocks the signal.
+                import time
+                time.sleep(1.0)
+            except KeyboardInterrupt:
+                break
+    finally:
+        click.echo("\nstopping alerts daemon (will finish in-flight pass)…")
+        scheduler.stop()
+        click.echo(f"alerts daemon stopped after {scheduler.passes_completed} passes")
 
 
 def attach_to(main: Any) -> None:
