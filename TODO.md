@@ -403,10 +403,12 @@ Goal: make claudeStruct usable end-to-end on a local AI workstation (Asus GX10 /
 
 ### Tier 2 — exploit local-only capabilities
 
-- [x] **W9.4 — Local prompt-cache (content-hashed)** — module shipped; CLI wiring pending
+- [x] **W9.4 — Local prompt-cache (content-hashed)** ✅ (storage + CLI wiring + provider integration all shipped)
   - `src/claudestruct/local_cache.py`: SHA-256 of `(provider, model, system, messages)` → cached `(text, usage, created_at)` blob in `~/.claudestruct/llm_cache/<aa>/<sha>.json` (two-level shard for scale). Atomic write-tmp-then-rename; corruption treated as miss (single bad file can't poison reads).
-  - `is_enabled()` reads `CLAUDESTRUCT_LLM_CACHE`; `stats()` + `clear()` for `cs dashboard` integration.
-  - 30 new tests. CLI flag `--llm-cache` + integration into `client.py` deferred to W9.1 PR (it'll wire alongside the OpenAI-compat client).
+  - `is_enabled_for(provider_name, override=...)` resolves CLI override → env var → default policy (`auto`: on for openai-compat, off for anthropic — anthropic SDK already negotiates server-side cache so a local cache layered on top would surprise users with stale text).
+  - `stats()` + `clear()` for `cs dashboard` integration.
+  - **CLI flag wiring**: `--llm-cache` (force on) + `--no-llm-cache` (force off) on every task subcommand (`cs dev`, `cs review`, `cs plan`, `cs debug`). Threads through `cli.py` → `runner.run_task` → `client.call_claude_one_shot` → `local_cache.is_enabled_for(..., override=llm_cache)`. Default (no flag) → `None` so the env-driven `auto` policy stays in charge.
+  - 30 prior storage-level tests + 5 runner-level tests in `tests/test_run_task_cache.py` + **3 new e2e CLI tests in `tests/test_e2e_cli.py`** locking the CLI flag plumbing (`--llm-cache` → `"on"`, `--no-llm-cache` → `"off"`, no-flag → `None`).
 
 - [x] **W9.5 — RAG-style smart context gathering** ✅ (shipped as W10.5; see Wave 10 entry)
 
