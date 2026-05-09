@@ -112,7 +112,7 @@ jobs:
           out="claw-sandbox-${GOOS}-${GOARCH}"
           go build -trimpath -ldflags="-s -w -X main.version=${REF_NAME}" -o "$out" .
           sha256sum "$out" > "$out.sha256"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: claw-sandbox-${{ matrix.goos }}-${{ matrix.goarch }}
           path: |
