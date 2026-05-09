@@ -100,6 +100,23 @@ describe("makeRunIoEvent", () => {
     });
     expect(withSub.subagentName).toBe("research-helper");
   });
+
+  it("includes reviewDecision only when provided (W11.5)", () => {
+    const without = makeRunIoEvent({
+      role: "coder",
+      prompt: "p",
+      responseText: "r",
+    });
+    expect("reviewDecision" in without).toBe(false);
+
+    const approved = makeRunIoEvent({
+      role: "reviewer",
+      prompt: "p",
+      responseText: "r",
+      reviewDecision: "approve",
+    });
+    expect(approved.reviewDecision).toBe("approve");
+  });
 });
 
 describe("runIoEnabled", () => {
@@ -224,6 +241,105 @@ describe("walkRunIo", () => {
     const out = [...walkRunIo(root)].map((e) => e.prompt);
     expect(out).toEqual(["from-a", "from-b"]);
   });
+
+  // --- W11.5 review-decision filter ---------------------------------
+
+  it("review-decision approve: drops a whole run when no reviewer event matches", () => {
+    // Run A: reviewer requested changes — coder turn must NOT survive
+    // the filter even though it has nothing to do with the verdict
+    // directly; the gate is per-run.
+    writeRunFile(root, "a.jsonl", [
+      ioEvent({ role: "coder", prompt: "coder-a" }),
+      ioEvent({
+        role: "reviewer",
+        prompt: "review-a",
+        reviewDecision: "request_changes",
+      }),
+    ]);
+    // Run B: reviewer approved.
+    writeRunFile(root, "b.jsonl", [
+      ioEvent({ role: "coder", prompt: "coder-b" }),
+      ioEvent({
+        role: "reviewer",
+        prompt: "review-b",
+        reviewDecision: "approve",
+      }),
+    ]);
+    const out = [
+      ...walkRunIo(root, { reviewDecision: "approve" }),
+    ].map((e) => e.prompt);
+    expect(out).toEqual(["coder-b", "review-b"]);
+  });
+
+  it("review-decision approve: keeps every event in a run with at least one matching reviewer event", () => {
+    writeRunFile(root, "a.jsonl", [
+      ioEvent({ role: "coder", prompt: "c1" }),
+      ioEvent({
+        role: "reviewer",
+        prompt: "r1",
+        reviewDecision: "request_changes",
+      }),
+      ioEvent({ role: "coder", prompt: "c2" }),
+      ioEvent({
+        role: "reviewer",
+        prompt: "r2",
+        reviewDecision: "approve",
+      }),
+    ]);
+    const out = [
+      ...walkRunIo(root, { reviewDecision: "approve" }),
+    ].map((e) => e.prompt);
+    expect(out).toEqual(["c1", "r1", "c2", "r2"]);
+  });
+
+  it("review-decision drops legacy runs with no reviewDecision field", () => {
+    writeRunFile(root, "a.jsonl", [
+      ioEvent({ role: "coder", prompt: "old-coder" }),
+      ioEvent({ role: "reviewer", prompt: "old-reviewer" }), // no reviewDecision
+    ]);
+    const out = [...walkRunIo(root, { reviewDecision: "approve" })];
+    expect(out).toEqual([]);
+  });
+
+  it("review-decision composes with role filter — reviewer turns dropped, coder turns survive", () => {
+    writeRunFile(root, "a.jsonl", [
+      ioEvent({ role: "coder", prompt: "coder-a" }),
+      ioEvent({
+        role: "reviewer",
+        prompt: "review-a",
+        reviewDecision: "approve",
+      }),
+    ]);
+    const out = [
+      ...walkRunIo(root, {
+        reviewDecision: "approve",
+        role: "coder",
+      }),
+    ].map((e) => e.prompt);
+    expect(out).toEqual(["coder-a"]);
+  });
+
+  it("review-decision request_changes is selectable too (not just approve)", () => {
+    writeRunFile(root, "a.jsonl", [
+      ioEvent({ role: "coder", prompt: "ca" }),
+      ioEvent({
+        role: "reviewer",
+        prompt: "ra",
+        reviewDecision: "request_changes",
+      }),
+    ]);
+    writeRunFile(root, "b.jsonl", [
+      ioEvent({
+        role: "reviewer",
+        prompt: "rb",
+        reviewDecision: "approve",
+      }),
+    ]);
+    const out = [
+      ...walkRunIo(root, { reviewDecision: "request_changes" }),
+    ].map((e) => e.prompt);
+    expect(out).toEqual(["ca", "ra"]);
+  });
 });
 
 describe("toAlpaca / toChat", () => {
@@ -316,6 +432,33 @@ describe("exportDataset", () => {
     const text = readFileSync(out, "utf-8");
     expect(text).not.toContain("STALE");
   });
+
+  it("--review-decision filter scopes exported rows to runs that passed review (W11.5)", () => {
+    writeRunFile(root, "a.jsonl", [
+      ioEvent({ role: "coder", prompt: "rejected-coder" }),
+      ioEvent({
+        role: "reviewer",
+        prompt: "rejected-reviewer",
+        reviewDecision: "request_changes",
+      }),
+    ]);
+    writeRunFile(root, "b.jsonl", [
+      ioEvent({ role: "coder", prompt: "approved-coder" }),
+      ioEvent({
+        role: "reviewer",
+        prompt: "approved-reviewer",
+        reviewDecision: "approve",
+      }),
+    ]);
+    const out = join(root, "out.jsonl");
+    const stats = exportDataset(root, out, { reviewDecision: "approve" });
+    expect(stats.rows).toBe(2);
+    const inputs = readFileSync(out, "utf-8")
+      .split("\n")
+      .filter(Boolean)
+      .map((l) => JSON.parse(l).input as string);
+    expect(inputs).toEqual(["approved-coder", "approved-reviewer"]);
+  });
 });
 
 describe("parseSince", () => {
@@ -394,6 +537,17 @@ describe("agent emits run-io when CLAW_SQUAD_LOG_PROMPTS=1", () => {
     expect((ioEvents[0] as { type: "run-io"; role: string }).role).toBe(
       "reviewer",
     );
+    // W11.5 — reviewer must stamp its decision onto the run-io event
+    // so dataset filters can scope to runs that passed review without
+    // re-parsing the response text.
+    expect(
+      (
+        ioEvents[0] as {
+          type: "run-io";
+          reviewDecision?: "approve" | "request_changes";
+        }
+      ).reviewDecision,
+    ).toBe("approve");
   });
 
   it("does not emit run-io when env gate is off (default)", async () => {

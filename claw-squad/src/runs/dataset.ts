@@ -53,6 +53,7 @@ export function makeRunIoEvent(args: {
   subagentName?: string;
   prompt: string;
   responseText: string;
+  reviewDecision?: "approve" | "request_changes";
 }): Extract<RunLogEvent, { type: "run-io" }> {
   const truncated = args.responseText.length > RUN_IO_RESPONSE_CAP;
   return {
@@ -65,6 +66,7 @@ export function makeRunIoEvent(args: {
       ? args.responseText.slice(0, RUN_IO_RESPONSE_CAP)
       : args.responseText,
     responseTruncated: truncated,
+    ...(args.reviewDecision ? { reviewDecision: args.reviewDecision } : {}),
   };
 }
 
@@ -85,6 +87,7 @@ export function emitRunIoIfEnabled(
     subagentName?: string;
     prompt: string;
     responseText: string;
+    reviewDecision?: "approve" | "request_changes";
   },
 ): void {
   if (!args.runLog || !runIoEnabled()) return;
@@ -94,6 +97,7 @@ export function emitRunIoIfEnabled(
       subagentName: args.subagentName,
       prompt: args.prompt,
       responseText: args.responseText,
+      reviewDecision: args.reviewDecision,
     }),
   );
 }
@@ -106,6 +110,21 @@ export interface WalkFilters {
   /** ISO 8601 cutoff. Events with no parseable `ts` are kept — better
    *  to over-include than silently drop. */
   since?: Date;
+  /**
+   * W11.5 — scope the corpus to runs whose Reviewer reached this
+   * decision at least once. Applied at the file level (a single
+   * .claw-squad/runs/<ts>.jsonl is one orchestrator run): if no
+   * `run-io` event in the file has `role="reviewer"` and a matching
+   * `reviewDecision`, every event in that file is dropped — including
+   * the coder/planner turns. Mirrors the intent in the W11.5
+   * roadmap entry: "fine-tune inputs are scoped to runs that passed
+   * review."
+   *
+   * Older logs (pre-W11.5) lack the field; treated as no-decision so
+   * they fail the `approve` filter, which is the safe default for
+   * fine-tune corpora.
+   */
+  reviewDecision?: "approve" | "request_changes";
 }
 
 function eventIsRunIo(
@@ -136,6 +155,16 @@ export function* walkRunIo(
     } catch {
       continue;
     }
+
+    // W11.5 — review-decision is a per-run gate. Pre-scan the file
+    // for at least one reviewer run-io event with a matching
+    // decision before yielding anything from it. We pay one extra
+    // string scan per file in exchange for being able to drop a
+    // whole run's coder/planner turns when the review didn't pass.
+    if (filters.reviewDecision && !fileHasReviewDecision(raw, filters.reviewDecision)) {
+      continue;
+    }
+
     for (const line of raw.split("\n")) {
       if (line.length === 0) continue;
       let parsed: RunLogEvent;
@@ -153,6 +182,29 @@ export function* walkRunIo(
       yield parsed;
     }
   }
+}
+
+function fileHasReviewDecision(
+  raw: string,
+  wanted: "approve" | "request_changes",
+): boolean {
+  for (const line of raw.split("\n")) {
+    if (line.length === 0) continue;
+    let parsed: RunLogEvent;
+    try {
+      parsed = JSON.parse(line) as RunLogEvent;
+    } catch {
+      continue;
+    }
+    if (
+      eventIsRunIo(parsed) &&
+      parsed.role === "reviewer" &&
+      parsed.reviewDecision === wanted
+    ) {
+      return true;
+    }
+  }
+  return false;
 }
 
 // --- Format conversion --------------------------------------------

@@ -125,15 +125,22 @@ export async function runReviewer(
     onText: input.onText,
   });
 
+  // Parse before emitting so the run-io event can carry the verdict
+  // (W11.5). Lets `dataset export --review-decision approve` filter
+  // a fine-tune corpus to runs that actually shipped without
+  // re-parsing every reviewer response downstream.
+  const verdict = parseReviewerOutput(usage.text);
+
   emitRunIoIfEnabled((e) => appendEvent(input.runLog!, e), {
     runLog: input.runLog,
     role: "reviewer",
     prompt: userMessage,
     responseText: usage.text,
+    reviewDecision: verdict.decision,
   });
 
   return {
-    verdict: parseReviewerOutput(usage.text),
+    verdict,
     message: usage.text,
     usage,
   };

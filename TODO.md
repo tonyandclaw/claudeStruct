@@ -629,12 +629,24 @@ local-first GTM thread visible on the roadmap.
   - Files: `claw-squad/src/agents/reviewer.ts`, `orchestrator.ts`
   - Scope: S (~50 LOC + 1-2 tests)
 
-- [ ] **W11.5 — Verdict-aware dataset filter** (W10.6 follow-up)
-  - `dataset.ts` currently captures every run regardless of
-    review outcome. Add `--review-decision approve` so fine-tune
-    inputs are scoped to runs that passed review.
-  - Files: `claw-squad/src/runs/dataset.ts`, CLI flag, docs
-  - Scope: S (~50 LOC)
+- [x] **W11.5 — Verdict-aware dataset filter** (W10.6 follow-up)
+  - Reviewer now stamps its parsed verdict onto the per-turn
+    `run-io` event (`reviewDecision: "approve" | "request_changes"`)
+    so dataset consumers don't have to re-parse the response text.
+  - `walkRunIo` / `exportDataset` accept `reviewDecision` filter; gate
+    is per-file (one .claw-squad/runs/<ts>.jsonl = one orchestrator
+    run): if no reviewer event in the file matches, every event in
+    that file is dropped — coder + planner turns included. Pre-W11.5
+    runs lacking the field fail the `approve` filter, which is the
+    safe default for fine-tune corpora.
+  - CLI: `claw-squad dataset export --review-decision <approve|request_changes>`.
+  - Files touched: `src/runs/log.ts` (event-type extension),
+    `src/runs/dataset.ts` (event factory + walker + filter),
+    `src/agents/reviewer.ts` (parse-then-emit reorder),
+    `src/cli.ts` (flag + validation), `tests/dataset.test.ts`
+    (+8 cases).
+  - Tests: `tests/dataset.test.ts` 43 cases pass; full claw-squad
+    suite 467/467; `npx tsc --noEmit` clean.
 
 The wave's success criterion: a local-only operator can cycle
 edit → review → ship without ever pinging the cloud, with the
