@@ -251,6 +251,87 @@ def test_dashboard_includes_seeded_run(env):
     assert runs[0]["cost_usd"] == 1.25
 
 
+# --- Pagination on /v1/dashboard ------------------------------------
+
+def _seed_jsonl_runs(env, count: int):
+    """Seed N JSONL run logs so the legacy dashboard has data."""
+    runs_dir = env["tmp_path"] / ".claudestruct" / "runs"
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    for i in range(count):
+        (runs_dir / f"r{i:04d}.jsonl").write_text(
+            "\n".join([
+                json.dumps({
+                    "type": "run.start",
+                    "ts": f"2026-04-15T10:{i:02d}:00+00:00",
+                    "task": "dev", "model": "claude-opus-4-7",
+                    "effort": "high", "promptVersion": "dev v=abc",
+                }),
+                json.dumps({
+                    "type": "agent.usage",
+                    "inputTokens": 10, "outputTokens": 5, "costUsd": 0.1,
+                }),
+                json.dumps({
+                    "type": "run.end",
+                    "ts": f"2026-04-15T10:{i:02d}:30+00:00",
+                    "reason": "complete", "durationMs": 30000,
+                    "totalCostUsd": 0.1,
+                }),
+            ]),
+            encoding="utf-8",
+        )
+
+
+def test_dashboard_default_limit_is_50(env):
+    _seed_jsonl_runs(env, 100)
+    r = env["client"].get(
+        "/v1/dashboard", headers=_auth(env["keys"]["viewer@a"]),
+    )
+    assert r.status_code == 200
+    assert len(r.json()["runs"]) == 50
+
+
+def test_dashboard_limit_caps_at_500(env):
+    """Anything above 500 rejects with 400 — without the cap, an
+    over-eager client could pull a 50 MB JSON in one shot."""
+    r = env["client"].get(
+        "/v1/dashboard?limit=10000",
+        headers=_auth(env["keys"]["viewer@a"]),
+    )
+    assert r.status_code == 400
+
+
+def test_dashboard_limit_below_1_rejects(env):
+    r = env["client"].get(
+        "/v1/dashboard?limit=0", headers=_auth(env["keys"]["viewer@a"]),
+    )
+    assert r.status_code == 400
+
+
+def test_dashboard_offset_skips_records(env):
+    """`offset=N` skips the first N rows so the caller can page
+    through history."""
+    _seed_jsonl_runs(env, 30)
+    page1 = env["client"].get(
+        "/v1/dashboard?limit=10&offset=0",
+        headers=_auth(env["keys"]["viewer@a"]),
+    ).json()["runs"]
+    page2 = env["client"].get(
+        "/v1/dashboard?limit=10&offset=10",
+        headers=_auth(env["keys"]["viewer@a"]),
+    ).json()["runs"]
+    assert len(page1) == 10
+    assert len(page2) == 10
+    assert {r["run_id"] for r in page1} & {r["run_id"] for r in page2} == set()
+
+
+def test_dashboard_negative_offset_rejected(env):
+    r = env["client"].get(
+        "/v1/dashboard?offset=-5",
+        headers=_auth(env["keys"]["viewer@a"]),
+    )
+    assert r.status_code == 400
+
+
 def test_budget_disabled_returns_zero_cap(env):
     r = env["client"].get("/v1/budget", headers=_auth(env["keys"]["viewer@a"]))
     assert r.status_code == 200
