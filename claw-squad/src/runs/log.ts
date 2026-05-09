@@ -115,6 +115,12 @@ export type RunLogEvent =
       // True when the model's response exceeded the 100 KB cap and
       // got truncated before disk write.
       responseTruncated?: boolean;
+      // W11.5 — only set for role="reviewer". The verdict the
+      // Reviewer arrived at on this turn, mirrored from the parsed
+      // ReviewVerdict.decision. Lets `dataset export
+      // --review-decision approve` scope the fine-tune corpus to
+      // turns that passed review without re-parsing the response.
+      reviewDecision?: "approve" | "request_changes";
     };
 
 /**

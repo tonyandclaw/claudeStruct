@@ -199,7 +199,7 @@ Goal: trust this in CI pipelines and long-running daemons. Wave 4 makes it insta
   - `src/claudestruct/secrets.py` — `SecretsProvider` Protocol with built-in `EnvProvider`, `KeyringProvider`, `PassProvider`, `FileProvider`. Provider chain is selected by `CLAUDESTRUCT_SECRETS_PROVIDER` (e.g. `env,keyring,pass,file:/run/secrets`); first-hit-wins. Default `env`-only for back-compat.
   - `client.py:_make_client()` now reads via `secrets.get("anthropic.api_key")`. Legacy `ANTHROPIC_API_KEY` env still works (mapped via `_LEGACY_ENV_MAP`).
   - Tests: `tests/test_secrets.py` (24 cases) — env canonical / legacy / precedence / empty-as-miss; file provider read / strip / missing / empty; pass provider no-binary / first-line / nonzero-exit; keyring no-module fallback; default_chain selection / unknowns skipped / empty falls back; get/require semantics; client integration
-  - Pending: AWS Secrets Manager + HashiCorp Vault providers (deferred; the abstraction is ready, the implementations need their respective SDKs as optional extras)
+  - **AWS Secrets Manager + Vault providers (this PR — B.9)**: `AwsSecretsManagerProvider` (boto3 lazy-imported under `[secrets-aws]` extra) and `VaultProvider` (hvac under `[secrets-vault]`). Both translate canonical `anthropic.api_key` into the cloud's native naming (`/`-delimited for AWS, KV-v2 path for Vault), cache for 60s with a `cache_ttl_s=0` test escape hatch, fail closed (return None) on any SDK / network error so the chain falls through to the next provider, and ship with a `client=` injection seam so 19 new tests in `tests/test_secrets_cloud.py` run offline. `default_chain()` parses `aws-secrets[:region]` and `vault[:url]` provider tokens; `CLAUDESTRUCT_SECRETS_PROVIDER=env,aws-secrets,vault` is the recommended prod chain (env-first lets a developer override a cloud secret locally without touching cloud config). Missing SDK raises `RuntimeError` with the install hint instead of an opaque `ImportError`.
 - [x] **W5.5 — Hardened sandbox**
   - `claw-sandbox/seccomp.json` — Docker / OCI / Kubernetes-compatible profile. `defaultAction=ALLOW` plus an explicit `ERRNO=1` denylist for ptrace + kernel modules (init/finit/delete) + kexec/reboot + mount/pivot_root/chroot + setuid/capset escalation + sethostname/clock-set + ioperm/iopl/bpf + unshare/setns + swapon/quotactl + add_key/keyctl/perf_event_open
   - `claw-sandbox/apparmor.profile` — sample profile mediating filesystem access. Allows /usr/lib + /lib + /workspace + /tmp + /etc/resolv.conf etc.; explicit deny for /etc/shadow, /root, ~/.ssh, ~/.aws/credentials, ~/.config/gh, /sys/kernel/{debug,tracing}, /dev/{mem,kmem,port}
@@ -590,6 +590,67 @@ Ship in roughly this order to maximize compounding value:
 5. **W10.9** (real netns isolation) — small change, big trust upgrade.
 6. **W10.5** (RAG context) and **W10.6** (Reviewer fine-tune) — biggest engineering lifts; take them last when the feedback loops are tight.
 7. **W10.7** (voice) and **W10.8** (nightly) — polish / habit features.
+
+---
+
+## Wave 11 — Local-first GX10 polish (proposed; A.9)
+
+Scattered follow-ups under W10.5 / W10.6 / W10.7 share a coherent
+theme: making the GX10 / local-inference experience first-class.
+Promoting them from per-item bullets to a named wave makes the
+local-first GTM thread visible on the roadmap.
+
+- [ ] **W11.1 — Index `--watch` mode** (W10.5 follow-up)
+  - File: save / git checkout triggers automatic index rebuild so
+    smart-context reflects the current working tree without a cron.
+  - Files: `src/claudestruct/indexer.py`, `claw-squad/src/index/build.ts`
+  - Scope: M (~150 LOC + tests; fs watch + sha-skip on both sides)
+
+- [ ] **W11.2 — Cross-tool index sharing** (W10.5 follow-up)
+  - Today `cs index` writes SQLite at `~/.claudestruct/index/`,
+    `claw-squad index` writes JSONL at `~/.claw-squad/index/`. A
+    single repo pays embedding cost twice. Land one canonical
+    on-disk format both tools read.
+  - Files: `src/claudestruct/index.py`,
+    `claw-squad/src/index/store.ts`, docs.
+  - Scope: M-L (~200 LOC + dual-side tests + migration doc)
+
+- [ ] **W11.3 — claw-squad `voice run`** (W10.7 TS-side deferred)
+  - Python `cs voice run` already works; TS counterpart needs Node
+    whisper.cpp binding (or HTTP delegation to the Python side).
+  - Files: `claw-squad/src/voice.ts` (new),
+    `claw-squad/src/cli.ts`, `claw-squad/docs/voice.md`
+  - Scope: M (~200 LOC + mocked tests)
+
+- [ ] **W11.4 — Reviewer-side smart-context** (W10.5b polish)
+  - Coder agent reads the top-K results today; Reviewer doesn't.
+    Apply the same `extraExplicitPaths` mechanism so reviewers
+    see sibling files when verdict requires it.
+  - Files: `claw-squad/src/agents/reviewer.ts`, `orchestrator.ts`
+  - Scope: S (~50 LOC + 1-2 tests)
+
+- [x] **W11.5 — Verdict-aware dataset filter** (W10.6 follow-up)
+  - Reviewer now stamps its parsed verdict onto the per-turn
+    `run-io` event (`reviewDecision: "approve" | "request_changes"`)
+    so dataset consumers don't have to re-parse the response text.
+  - `walkRunIo` / `exportDataset` accept `reviewDecision` filter; gate
+    is per-file (one .claw-squad/runs/<ts>.jsonl = one orchestrator
+    run): if no reviewer event in the file matches, every event in
+    that file is dropped — coder + planner turns included. Pre-W11.5
+    runs lacking the field fail the `approve` filter, which is the
+    safe default for fine-tune corpora.
+  - CLI: `claw-squad dataset export --review-decision <approve|request_changes>`.
+  - Files touched: `src/runs/log.ts` (event-type extension),
+    `src/runs/dataset.ts` (event factory + walker + filter),
+    `src/agents/reviewer.ts` (parse-then-emit reorder),
+    `src/cli.ts` (flag + validation), `tests/dataset.test.ts`
+    (+8 cases).
+  - Tests: `tests/dataset.test.ts` 43 cases pass; full claw-squad
+    suite 467/467; `npx tsc --noEmit` clean.
+
+The wave's success criterion: a local-only operator can cycle
+edit → review → ship without ever pinging the cloud, with the
+same UX as the cloud path.
 
 ---
 

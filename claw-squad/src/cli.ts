@@ -1092,6 +1092,19 @@ datasetCmd
     },
     "alpaca",
   )
+  .option<"approve" | "request_changes">(
+    "--review-decision <decision>",
+    "Only include events from runs whose Reviewer reached this decision (W11.5). " +
+      "Choices: approve / request_changes. Older runs missing the field are dropped.",
+    (val): "approve" | "request_changes" => {
+      if (val !== "approve" && val !== "request_changes") {
+        throw new Error(
+          `--review-decision must be 'approve' or 'request_changes'; got ${JSON.stringify(val)}`,
+        );
+      }
+      return val;
+    },
+  )
   .action(
     async (opts: {
       out: string;
@@ -1099,6 +1112,7 @@ datasetCmd
       role?: string;
       since?: string;
       format: "alpaca" | "chat";
+      reviewDecision?: "approve" | "request_changes";
     }) => {
       const { exportDataset, parseSince } = await import("./runs/dataset.js");
       const { ROLE_BUCKETS } = await import("./types.js");
@@ -1136,6 +1150,7 @@ datasetCmd
         role,
         since,
         format: opts.format,
+        reviewDecision: opts.reviewDecision,
       });
 
       if (stats.rows === 0) {
