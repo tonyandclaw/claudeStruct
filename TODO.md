@@ -593,6 +593,55 @@ Ship in roughly this order to maximize compounding value:
 
 ---
 
+## Wave 11 — Local-first GX10 polish (proposed; A.9)
+
+Scattered follow-ups under W10.5 / W10.6 / W10.7 share a coherent
+theme: making the GX10 / local-inference experience first-class.
+Promoting them from per-item bullets to a named wave makes the
+local-first GTM thread visible on the roadmap.
+
+- [ ] **W11.1 — Index `--watch` mode** (W10.5 follow-up)
+  - File: save / git checkout triggers automatic index rebuild so
+    smart-context reflects the current working tree without a cron.
+  - Files: `src/claudestruct/indexer.py`, `claw-squad/src/index/build.ts`
+  - Scope: M (~150 LOC + tests; fs watch + sha-skip on both sides)
+
+- [ ] **W11.2 — Cross-tool index sharing** (W10.5 follow-up)
+  - Today `cs index` writes SQLite at `~/.claudestruct/index/`,
+    `claw-squad index` writes JSONL at `~/.claw-squad/index/`. A
+    single repo pays embedding cost twice. Land one canonical
+    on-disk format both tools read.
+  - Files: `src/claudestruct/index.py`,
+    `claw-squad/src/index/store.ts`, docs.
+  - Scope: M-L (~200 LOC + dual-side tests + migration doc)
+
+- [ ] **W11.3 — claw-squad `voice run`** (W10.7 TS-side deferred)
+  - Python `cs voice run` already works; TS counterpart needs Node
+    whisper.cpp binding (or HTTP delegation to the Python side).
+  - Files: `claw-squad/src/voice.ts` (new),
+    `claw-squad/src/cli.ts`, `claw-squad/docs/voice.md`
+  - Scope: M (~200 LOC + mocked tests)
+
+- [ ] **W11.4 — Reviewer-side smart-context** (W10.5b polish)
+  - Coder agent reads the top-K results today; Reviewer doesn't.
+    Apply the same `extraExplicitPaths` mechanism so reviewers
+    see sibling files when verdict requires it.
+  - Files: `claw-squad/src/agents/reviewer.ts`, `orchestrator.ts`
+  - Scope: S (~50 LOC + 1-2 tests)
+
+- [ ] **W11.5 — Verdict-aware dataset filter** (W10.6 follow-up)
+  - `dataset.ts` currently captures every run regardless of
+    review outcome. Add `--review-decision approve` so fine-tune
+    inputs are scoped to runs that passed review.
+  - Files: `claw-squad/src/runs/dataset.ts`, CLI flag, docs
+  - Scope: S (~50 LOC)
+
+The wave's success criterion: a local-only operator can cycle
+edit → review → ship without ever pinging the cloud, with the
+same UX as the cloud path.
+
+---
+
 ## Post-roadmap PRs (selected from R/F candidate list)
 
 - [~] **R2 + F1 + F8 — orchestrator integration test, MCP server, cross-tool dashboard**
