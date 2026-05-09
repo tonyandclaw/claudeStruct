@@ -4,6 +4,12 @@
 ``server/worker.py``) picks it up. ``GET /v1/runs/{id}`` reads the
 DB first, falling back to the JSONL log so historical runs (created
 before W6.1 landed) remain accessible.
+
+Optional ``Idempotency-Key`` header on POST: a client can resubmit
+a request safely (e.g. after a network blip) by sending the same
+opaque string a second time — we'll return the *original* run's
+response without creating a duplicate. Scoped per-org via the
+``(org_id, idempotency_key)`` UNIQUE constraint on the Run table.
 """
 from __future__ import annotations
 
@@ -11,8 +17,9 @@ import json
 import secrets
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from claudestruct import dashboard as dash_mod
@@ -72,6 +79,7 @@ def _enforce_token_cap(session: Session, *, org_id: int) -> None:
 )
 def create_run(
     body: CreateRunRequest,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     principal: auth_mod.Principal = Depends(auth_mod.require_role(Role.member)),
     session: Session = Depends(auth_mod.get_session),
 ) -> CreateRunResponse:
@@ -87,8 +95,42 @@ def create_run(
     already burned its monthly token cap. The 402 body lists usage,
     cap, period_end, and tier so the SPA / CLI can render a single
     actionable upgrade prompt without a follow-up call.
+
+    Idempotency: optional ``Idempotency-Key`` request header. When
+    set, a second submit with the same `(org_id, key)` returns the
+    original run's identifier instead of creating a duplicate — the
+    standard pattern for safely retrying after a network blip. Scoped
+    per-org via the UNIQUE constraint on `Run.idempotency_key`.
     """
     _enforce_token_cap(session, org_id=principal.org_id)
+
+    # If the caller supplied an idempotency key, look up an existing
+    # submission BEFORE writing a new row. Empty / whitespace-only
+    # keys are treated as absent so a client can't accidentally
+    # collide every run with the empty string. Both the lookup and
+    # the row write use the same normalised value (None for empty)
+    # so the UNIQUE constraint never sees an empty string.
+    idem = idempotency_key.strip() if idempotency_key else None
+    if idem == "":
+        idem = None
+    if idem:
+        existing = session.execute(
+            select(Run).where(
+                Run.org_id == principal.org_id,
+                Run.idempotency_key == idem,
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            # Replay the original response. Status reflects current
+            # state (the worker may have already moved it forward),
+            # so the caller gets useful information rather than a
+            # stale "queued".
+            return CreateRunResponse(
+                run_id=existing.run_id,
+                status=existing.status,
+                note="idempotent replay",
+            )
+
     # 8 hex bytes → 16 chars; collision-resistant within the per-org
     # key space and short enough for log lines / URL paths.
     run_id = f"run-{secrets.token_hex(8)}"
@@ -102,9 +144,30 @@ def create_run(
         model=body.model,
         effort=body.effort,
         paths_json=json.dumps(body.paths) if body.paths else None,
+        idempotency_key=idem,
     )
     session.add(row)
-    session.flush()
+    try:
+        session.flush()
+    except IntegrityError:
+        # Race: another concurrent request inserted the same
+        # (org_id, idempotency_key) between our SELECT above and
+        # this INSERT. Roll back, re-fetch, and replay the original.
+        session.rollback()
+        if idem:
+            existing = session.execute(
+                select(Run).where(
+                    Run.org_id == principal.org_id,
+                    Run.idempotency_key == idem,
+                )
+            ).scalar_one_or_none()
+            if existing is not None:
+                return CreateRunResponse(
+                    run_id=existing.run_id,
+                    status=existing.status,
+                    note="idempotent replay (race)",
+                )
+        raise
     audit_mod.record(
         session,
         org_id=principal.org_id,

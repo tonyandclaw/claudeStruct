@@ -39,6 +39,7 @@ from claudestruct.server.schema import (
     SubscriptionResponse,
     UsageResponse,
 )
+from claudestruct.server.webhook_metrics import WEBHOOK_ERRORS
 
 router = APIRouter(prefix="/v1/billing", tags=["billing"])
 
@@ -341,6 +342,9 @@ def _update_subscription_period(session: Session, sub, subscription_id: str) -> 
     try:
         stripe_sub = stripe.Subscription.retrieve(subscription_id)
     except Exception:  # noqa: BLE001
+        WEBHOOK_ERRORS.bump(
+            path="stripe.subscription_retrieve", reason="stripe_error",
+        )
         return
 
     sub.current_period_start = datetime.fromisoformat(

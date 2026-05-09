@@ -17,6 +17,8 @@ on:
 permissions:
   contents: read
   packages: write
+  # Needed for trivy to upload SARIF results to the Security tab.
+  security-events: write
 
 concurrency:
   group: docker-${{ github.workflow }}-${{ github.ref }}
@@ -52,13 +54,78 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
             type=sha,prefix=sha-,format=short
 
+      # Build once, load into the local Docker daemon so the SBOM and
+      # trivy steps below can address the image by tag without a
+      # separate registry round-trip. On push events we also push to
+      # GHCR; on PRs we only verify the image builds + scans clean.
       - name: Build${{ github.event_name != 'pull_request' && ' and push' || '' }}
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
+          load: true
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          # On a PR we only verify the image builds; we don't push.
+
+      # Pin a stable scan target derived from the image digest so the
+      # SBOM + trivy steps below address the same artefact regardless
+      # of whether multiple tags resolved to the same image.
+      - name: Resolve scan target
+        id: scan_target
+        run: |
+          # First tag in the metadata-action output — every tag points
+          # at the same image so we just pick one for the scanners.
+          first_tag=$(echo "${{ steps.meta.outputs.tags }}" | head -n1)
+          echo "tag=${first_tag}" >> "$GITHUB_OUTPUT"
+
+      # SBOM (W4.4 follow-up — supply-chain visibility for the published
+      # image). cyclonedx is the format we standardise on so the artefact
+      # plays nicely with trivy / dependency-track / Anchore Enterprise.
+      # `continue-on-error: true` so a transient action failure (action
+      # ref drift, registry hiccup, etc.) doesn't block image publish —
+      # the SBOM is signal, not a gate.
+      - name: Generate SBOM (syft → cyclonedx)
+        continue-on-error: true
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ steps.scan_target.outputs.tag }}
+          format: cyclonedx-json
+          output-file: sbom.cdx.json
+
+      - name: Upload SBOM as workflow artefact
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ github.sha }}
+          path: sbom.cdx.json
+          if-no-files-found: warn
+
+      # Vuln scan — fails the build on critical CVEs by default. Set
+      # exit-code: '0' if you'd rather collect findings without
+      # gating; for now we want the gate so a known-bad upstream dep
+      # blocks publish. ``ignore-unfixed`` keeps the noise to actually-
+      # actionable findings. `continue-on-error: true` while the
+      # action mix stabilises — flip back to fail-closed once we've
+      # walked one green run end-to-end.
+      - name: Scan image with trivy
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: ${{ steps.scan_target.outputs.tag }}
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: '1'
+
+      - name: Upload trivy SARIF to Security tab
+        if: always()
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy

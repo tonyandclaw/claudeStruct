@@ -430,12 +430,25 @@ def serve_worker(db_url: str | None, run_root: str, once: bool,
         session_factory=factory,
         poll_interval_s=poll_interval,
     )
-    click.echo(f"worker started (poll {poll_interval}s); Ctrl-C to stop")
+    # SIGTERM is what k8s / systemd send during pod termination
+    # (`kubectl rollout restart`, `kill -TERM <pid>`, etc.); the
+    # default Python handler exits the process without triggering
+    # `KeyboardInterrupt`, which would skip the graceful drain
+    # and leave the in-flight Run row stuck in "running".
+    # Re-raise as KeyboardInterrupt so the existing handler path
+    # runs `thread.stop()`.
+    import signal as _signal
+
+    def _on_sigterm(signum, frame):  # pragma: no cover — signal path
+        raise KeyboardInterrupt
+    _signal.signal(_signal.SIGTERM, _on_sigterm)
+
+    click.echo(f"worker started (poll {poll_interval}s); SIGINT/SIGTERM to stop gracefully")
     thread.start()
     try:
         # Block the foreground until the user interrupts. The worker
         # thread is daemon so a hard kill won't leak it; the SIGINT
-        # path below is for graceful drain.
+        # / SIGTERM path below is for graceful drain.
         thread._thread.join() if thread._thread else None  # noqa: SLF001
     except KeyboardInterrupt:
         click.echo("\nstopping worker (will finish in-flight run)…")
@@ -505,14 +518,26 @@ def serve_alerts(db_url: str | None, sigma: float, lookback_days: int,
         lookback_days=lookback_days,
         check_recent_hours=check_recent_hours,
     )
+    # SIGTERM trap (k8s / systemd shutdown) — re-raise as
+    # KeyboardInterrupt so the existing handler path drains
+    # cleanly. Without this the default Python handler exits the
+    # process without invoking the `finally:` block below, leaving
+    # an in-flight notifier call orphaned.
+    import signal as _signal
+
+    def _on_sigterm(signum, frame):  # pragma: no cover — signal path
+        raise KeyboardInterrupt
+    _signal.signal(_signal.SIGTERM, _on_sigterm)
+
     click.echo(
         f"alerts daemon: interval={interval}s, notifier={notifier.name}, "
-        f"sigma={sigma}, lookback_days={lookback_days}. Ctrl-C to stop."
+        f"sigma={sigma}, lookback_days={lookback_days}. SIGINT/SIGTERM to stop."
     )
     scheduler.start()
     try:
-        # Block the main thread until SIGINT — the scheduler thread
-        # is a daemon, so we own the lifetime here.
+        # Block the main thread until SIGINT/SIGTERM — the
+        # scheduler thread is a daemon, so we own the lifetime
+        # here.
         while True:
             try:
                 # Sleep in 1s slices so Ctrl-C lands promptly on

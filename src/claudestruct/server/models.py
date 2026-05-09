@@ -193,12 +193,27 @@ class Run(Base):
     """
 
     __tablename__ = "runs"
+    __table_args__ = (
+        # Idempotency-Key is unique per org so two orgs can each
+        # use the same opaque key without colliding. Nullable so
+        # callers that don't supply the header still create rows.
+        UniqueConstraint(
+            "org_id", "idempotency_key", name="uq_run_idempotency",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     run_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     org_id: Mapped[int] = mapped_column(ForeignKey("orgs.id", ondelete="CASCADE"), index=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
     status: Mapped[str] = mapped_column(String(16), default=RunStatus.queued.value, index=True)
+    # Optional idempotency key from the `Idempotency-Key` request
+    # header on POST /v1/runs. Scoped per-org via the UNIQUE
+    # constraint above; resubmitting the same (org, key) returns
+    # the original run instead of creating a duplicate.
+    idempotency_key: Mapped[str | None] = mapped_column(
+        String(255), nullable=True, index=True,
+    )
 
     # Request shape — kept on the row for audit + replay even after
     # the JSONL log is purged.
@@ -217,9 +232,18 @@ class Run(Base):
     duration_ms: Mapped[int | None] = mapped_column(nullable=True)
     error: Mapped[str | None] = mapped_column(String(4096), nullable=True)
 
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now_utc)
-    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Timestamp indexes: SLO + dashboard + alert detectors all
+    # filter by these. Indexed so the rolling-window queries
+    # (`Run.created_at >= cutoff`) don't scan the whole table.
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now_utc, index=True,
+    )
+    started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True,
+    )
+    ended_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True,
+    )
 
     # W6.6 verdict-on-completion: when a run was enqueued by the
     # GitHub App webhook, these track which PR to post the verdict

@@ -121,3 +121,21 @@ def get_slo_latency(request: Request) -> str:
     """
     tracker: LatencyTracker = request.app.state.latency_tracker
     return tracker.render_prometheus()
+
+
+@router.get("/v1/slo/webhook_errors", response_class=PlainTextResponse)
+def get_slo_webhook_errors() -> str:
+    """Prometheus text exposure of best-effort outbound IO failures
+    (C.3).
+
+    Counts swallowed failures from worker / router code that fires
+    side-effect IO (GitHub comments, Stripe subscription fetches,
+    etc.) and silently continues on error. Operators can alert on
+    ``rate(claudestruct_webhook_errors_total{path="..."}[5m])``
+    rather than grep-parsing log lines.
+
+    Unauthenticated for the same reason as ``/v1/slo/latency`` — the
+    payload is aggregate counts, no per-tenant data.
+    """
+    from claudestruct.server.webhook_metrics import WEBHOOK_ERRORS
+    return WEBHOOK_ERRORS.render_prometheus()
