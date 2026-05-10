@@ -685,6 +685,12 @@ same UX as the cloud path.
 
 ## Last Update
 
+- 2026-05-10 — C.1 (step 3): extract clone_push.py from `github_app/__init__.py`:
+  - Pulls `_run_git`, `_git_credential_approve`, `_prepare_repo_push`, `_push_branch_via_git`, and the `open_pr_as_bot` orchestrator out of `__init__.py` into a focused `github_app/clone_push.py` (317 LOC). `__init__.py` shrinks from 1058 → 784 LOC.
+  - Symbols re-exported from `__init__.py` via `from .clone_push import …` so `from claudestruct.server.github_app import open_pr_as_bot` (worker.py) keeps resolving — zero call-site churn.
+  - Lazy imports inside `_prepare_repo_push` (for `get_ref_sha`) and `open_pr_as_bot` (for `mint_app_jwt` + `create_pull_request`) dodge the circular dep on the still-loading parent package. Type hints reference `GitHubAppConfig` / `InstallationTokenCache` via `TYPE_CHECKING` so static checkers see the symbols without running the import at module-load.
+  - Removed now-unused `shutil` / `subprocess` / `tempfile` / `pathlib.Path` imports from `__init__.py`.
+  - 821 passed, 3 skipped (unchanged from step 2 — same suite, exact same outcomes); ruff clean. Continues the C.1 split sequence; remaining cuts (`auth.py` for JWT minting + `InstallationTokenCache`, `comments.py` for `post_pr_comment` + `post_ack_comment` + `format_verdict_body`) are mechanical follow-ups on the same pattern.
 - 2026-05-01 — W10.4 (local prompt-result cache) wiring ready for PR push:
   - Storage primitives shipped earlier as W9.4; this PR completes the call-path wiring + provider-aware policy + CLI flags
   - `cache_key` now includes `effort` + `max_tokens` so quality knobs don't collide on replay; `is_enabled_for(provider, override)` defaults to ON for openai-compat / OFF for Anthropic (auto) but obeys env + per-run overrides
