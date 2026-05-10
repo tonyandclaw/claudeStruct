@@ -602,20 +602,24 @@ theme: making the GX10 / local-inference experience first-class.
 Promoting them from per-item bullets to a named wave makes the
 local-first GTM thread visible on the roadmap.
 
-- [ ] **W11.1 — Index `--watch` mode** (W10.5 follow-up)
-  - File: save / git checkout triggers automatic index rebuild so
-    smart-context reflects the current working tree without a cron.
-  - Files: `src/claudestruct/indexer.py`, `claw-squad/src/index/build.ts`
-  - Scope: M (~150 LOC + tests; fs watch + sha-skip on both sides)
+- [x] **W11.1 — Index `--watch` mode** ✅ (already shipped)
+  - `src/claudestruct/indexer.py:watch_index` (Python; injectable
+    `sleep` for tests + `max_iterations` cap) and
+    `claw-squad/src/index/build.ts:watchIndex` (TS).
+    `cs index build --watch [interval]` and
+    `claw-squad index --watch [interval]` both poll-rebuild every
+    N seconds; the `EmbeddingError` path catches transient endpoint
+    outages so a long-running watch survives an Ollama restart.
+    Listed here for cross-reference; no code change needed.
 
-- [ ] **W11.2 — Cross-tool index sharing** (W10.5 follow-up)
-  - Today `cs index` writes SQLite at `~/.claudestruct/index/`,
-    `claw-squad index` writes JSONL at `~/.claw-squad/index/`. A
-    single repo pays embedding cost twice. Land one canonical
-    on-disk format both tools read.
-  - Files: `src/claudestruct/index.py`,
-    `claw-squad/src/index/store.ts`, docs.
-  - Scope: M-L (~200 LOC + dual-side tests + migration doc)
+- [x] **W11.2 — Cross-tool index sharing** ✅ (already shipped)
+  - `src/claudestruct/index_io.py:export_to_jsonl` /
+    `import_from_jsonl` ships `cs index export --out shared.jsonl`
+    and `cs index import --in shared.jsonl`. The JSONL format
+    matches the TS-side storage format byte-for-byte (sorted by
+    rel_path, JSON-encoded embeddings) so a Python build can drop
+    a file the TS tool reads, and vice versa. One repo embeds
+    once; both tools share the result.
 
 - [ ] **W11.3 — claw-squad `voice run`** (W10.7 TS-side deferred)
   - Python `cs voice run` already works; TS counterpart needs Node

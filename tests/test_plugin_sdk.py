@@ -254,3 +254,67 @@ def test_load_plugins_returns_merged_result(monkeypatch):
     merged = load_plugins()
     assert isinstance(merged, MergedPlugins)
     assert [p.name for p in merged.plugins] == ["loaded"]
+
+
+# --- Reference plugin (examples/plugin_sample) ---------------------
+
+
+def test_reference_plugin_validates_against_sdk():
+    """The in-tree reference plugin must pass `is_plugin()` so it
+    serves as a copy-paste-ready template for third-party authors."""
+    import sys
+    from pathlib import Path
+    repo_root = Path(__file__).resolve().parents[1]
+    sys.path.insert(0, str(repo_root))
+    try:
+        from examples.plugin_sample import plugin as sample_plugin
+    finally:
+        sys.path.pop(0)
+    assert is_plugin(sample_plugin)
+    assert sample_plugin.api_version == PLUGIN_API_VERSION
+    assert sample_plugin.name == "claudestruct-plugin-sample"
+    # Ships at least one subagent + one skill so a host that only
+    # discovers this plugin still gets meaningful contributions.
+    assert len(sample_plugin.subagents) >= 1
+    assert len(sample_plugin.skills) >= 1
+
+
+def test_reference_plugin_uses_prefixed_skill_id():
+    """The sample's skill id must NOT collide with a likely-real
+    upstream id (`python-testing`). Convention: prefix with
+    `example-` or your project's name so the dedup doesn't
+    accidentally suppress a real plugin."""
+    import sys
+    from pathlib import Path
+    repo_root = Path(__file__).resolve().parents[1]
+    sys.path.insert(0, str(repo_root))
+    try:
+        from examples.plugin_sample import plugin as sample_plugin
+    finally:
+        sys.path.pop(0)
+    skill_ids = [s.id for s in sample_plugin.skills]
+    for sid in skill_ids:
+        # Either prefixed with "example-" or includes the project
+        # name "sample" — both signal "this is a demo".
+        assert "example" in sid or "sample" in sid, (
+            f"sample plugin skill id {sid!r} should be prefixed "
+            f"so it doesn't shadow a real upstream skill"
+        )
+
+
+def test_reference_plugin_round_trips_through_merge():
+    """Merging the sample as a single plugin produces a populated
+    MergedPlugins (1 plugin, ≥1 subagent, ≥1 skill). Catches a
+    regression where the SDK silently drops well-formed entries."""
+    import sys
+    from pathlib import Path
+    repo_root = Path(__file__).resolve().parents[1]
+    sys.path.insert(0, str(repo_root))
+    try:
+        from examples.plugin_sample import plugin as sample_plugin
+    finally:
+        sys.path.pop(0)
+    merged = merge_plugins([sample_plugin])
+    assert len(merged.plugins) == 1
+    assert len(merged.subagents) == len(sample_plugin.subagents)
+    assert len(merged.skills) == len(sample_plugin.skills)
