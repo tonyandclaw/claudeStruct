@@ -44,9 +44,32 @@ def _resolve_root(request: Request) -> Path:
 @router.get("/dashboard", response_model=DashboardResponse)
 def get_dashboard(
     request: Request,
+    limit: int = 50,
+    offset: int = 0,
     principal: auth_mod.Principal = Depends(auth_mod.require_role(Role.viewer)),
 ) -> DashboardResponse:
+    """Read the legacy JSONL run store.
+
+    Production-readiness: paginated (`?limit=`, `?offset=`) so a
+    historic run-log of 10k+ rows doesn't return a 50 MB JSON in
+    one response. Defaults to the most-recent 50 runs starting
+    at offset 0; max `limit` is 500 — same ceiling as
+    `/v1/dashboard/team` so the frontend can use a single
+    pagination component for both.
+    """
+    if limit < 1 or limit > 500:
+        raise HTTPException(
+            status_code=400, detail="limit must be between 1 and 500",
+        )
+    if offset < 0:
+        raise HTTPException(
+            status_code=400, detail="offset must be >= 0",
+        )
     summaries = dash_mod.load_summaries(_resolve_root(request))
+    # `load_summaries` already returns most-recent-first; slice
+    # AFTER ordering rather than re-sorting the whole list per
+    # request.
+    page = summaries[offset : offset + limit]
     rows = [
         RunRow(
             run_id=s.run_id,
@@ -64,7 +87,7 @@ def get_dashboard(
             cost_usd=round(s.cost_usd, 6),
             cache_warnings=s.cache_warnings,
         )
-        for s in summaries
+        for s in page
     ]
     return DashboardResponse(runs=rows)
 

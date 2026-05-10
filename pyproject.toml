@@ -85,6 +85,30 @@ voice = [
 mutation = [
   "mutmut>=2.4",
 ]
+# `pip install claudestruct[secrets-aws]` enables the AWS Secrets
+# Manager backend in `claudestruct.secrets`. boto3 is heavy (~30 MB
+# of botocore data) so it's opt-in. Operators that wire the
+# `aws-secrets` provider in CLAUDESTRUCT_SECRETS_PROVIDER pull this in.
+secrets-aws = [
+  "boto3>=1.34",
+]
+# `pip install claudestruct[kms-aws]` enables the AWS KMS provider in
+# `claudestruct.server.crypto` for envelope-encryption (W8.6 CMEK).
+# Same boto3 dep as `secrets-aws` so installing both is free.
+kms-aws = [
+  "boto3>=1.34",
+]
+# `pip install claudestruct[kms-gcp]` enables the GCP KMS provider.
+# google-cloud-kms is the official Google client; auth uses
+# Application Default Credentials.
+kms-gcp = [
+  "google-cloud-kms>=2.20",
+]
+# `pip install claudestruct[secrets-vault]` enables the HashiCorp
+# Vault KV-v2 backend. hvac is light but unrelated to most installs.
+secrets-vault = [
+  "hvac>=2.1",
+]
 
 [project.scripts]
 cs = "claudestruct.cli:main"

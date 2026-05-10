@@ -199,7 +199,7 @@ Goal: trust this in CI pipelines and long-running daemons. Wave 4 makes it insta
   - `src/claudestruct/secrets.py` — `SecretsProvider` Protocol with built-in `EnvProvider`, `KeyringProvider`, `PassProvider`, `FileProvider`. Provider chain is selected by `CLAUDESTRUCT_SECRETS_PROVIDER` (e.g. `env,keyring,pass,file:/run/secrets`); first-hit-wins. Default `env`-only for back-compat.
   - `client.py:_make_client()` now reads via `secrets.get("anthropic.api_key")`. Legacy `ANTHROPIC_API_KEY` env still works (mapped via `_LEGACY_ENV_MAP`).
   - Tests: `tests/test_secrets.py` (24 cases) — env canonical / legacy / precedence / empty-as-miss; file provider read / strip / missing / empty; pass provider no-binary / first-line / nonzero-exit; keyring no-module fallback; default_chain selection / unknowns skipped / empty falls back; get/require semantics; client integration
-  - Pending: AWS Secrets Manager + HashiCorp Vault providers (deferred; the abstraction is ready, the implementations need their respective SDKs as optional extras)
+  - **AWS Secrets Manager + Vault providers (this PR — B.9)**: `AwsSecretsManagerProvider` (boto3 lazy-imported under `[secrets-aws]` extra) and `VaultProvider` (hvac under `[secrets-vault]`). Both translate canonical `anthropic.api_key` into the cloud's native naming (`/`-delimited for AWS, KV-v2 path for Vault), cache for 60s with a `cache_ttl_s=0` test escape hatch, fail closed (return None) on any SDK / network error so the chain falls through to the next provider, and ship with a `client=` injection seam so 19 new tests in `tests/test_secrets_cloud.py` run offline. `default_chain()` parses `aws-secrets[:region]` and `vault[:url]` provider tokens; `CLAUDESTRUCT_SECRETS_PROVIDER=env,aws-secrets,vault` is the recommended prod chain (env-first lets a developer override a cloud secret locally without touching cloud config). Missing SDK raises `RuntimeError` with the install hint instead of an opaque `ImportError`.
 - [x] **W5.5 — Hardened sandbox**
   - `claw-sandbox/seccomp.json` — Docker / OCI / Kubernetes-compatible profile. `defaultAction=ALLOW` plus an explicit `ERRNO=1` denylist for ptrace + kernel modules (init/finit/delete) + kexec/reboot + mount/pivot_root/chroot + setuid/capset escalation + sethostname/clock-set + ioperm/iopl/bpf + unshare/setns + swapon/quotactl + add_key/keyctl/perf_event_open
   - `claw-sandbox/apparmor.profile` — sample profile mediating filesystem access. Allows /usr/lib + /lib + /workspace + /tmp + /etc/resolv.conf etc.; explicit deny for /etc/shadow, /root, ~/.ssh, ~/.aws/credentials, ~/.config/gh, /sys/kernel/{debug,tracing}, /dev/{mem,kmem,port}
@@ -317,7 +317,8 @@ Goal: distribution. Make the product discoverable, easy to install, and easy to 
   - Auto-discovery: scan `<repoRoot>/node_modules/claudestruct-plugin-*`, resolve entry via `package.json` `main` / `exports["."]` / fallbacks, dynamic-import via `pathToFileURL`, validate with `isPlugin()`, merge with deterministic dedup (first plugin wins for duplicate names, surfaced as a warning).
   - Plugins contribute new subagents and skills only — Planner/Coder/Reviewer roles stay core (a plugin flipping the orchestrator state machine breaks every other plugin).
   - Tests: `claw-squad/tests/plugins.test.ts` (20 cases) — `isPlugin` validation matrix, prefix discovery + non-dir filtering, CJS + ESM loaders, missing entry / bad shape / wrong apiVersion warnings, merge dedup of plugins/subagents/skills, end-to-end `loadPluginsFromRepo`
-  - Pending: PyPI-side equivalent (claudestruct plugins), published `claudestruct-plugin-sdk` package on npm
+  - **Python plugin SDK (this PR — W7.4 mirror)**: `src/claudestruct/plugin_sdk/` ships `Plugin` / `SubagentContribution` / `SkillContribution` dataclasses, `PLUGIN_API_VERSION=1` (matches the TS side so plugin authors carry one mental model), `is_plugin()` validator, `merge_plugins()` with the same dedup rules as TS (first-wins on duplicate plugin name / subagent name / skill id, all logged), and `discover_plugins()` reading the `claudestruct.plugins` entry-point group. A broken third-party package logs and is skipped — one bad install doesn't block the rest. Plugins declare themselves in their `pyproject.toml` via `[project.entry-points."claudestruct.plugins"]`. 16 new tests in `tests/test_plugin_sdk.py`.
+  - Pending: published `claudestruct-plugin-sdk` package on PyPI / `claudestruct-plugin-sdk` on npm — both contracts are now in-tree; only the publish remains.
 - [~] **W7.5 — Public playground** (static demo page shipped; live runner deferred behind hosting / rate-limiter / billing decisions)
   - `docs/playground.md` — pre-recorded real `cs review` / `dev` / `plan` / `debug` outputs so visitors can read the verdict shape, diff format, hypothesis ranking, and usage / cache-hit-rate banner before installing. No JS, no hosting cost, deploys via the existing GitHub Pages workflow.
   - "Why no live runner" footer is honest about the cost calculus: every visitor needs an API key or a shared bucket with a rate-limiter / abuse-mitigation queue / billing line. Replaced when W7.5b (hosted bucket) lands.
@@ -379,8 +380,9 @@ Goal: a managed service teams pay for. Open-core split: Waves 4-7 OSS, Wave 8 ho
 - [x] **W8.6 — Customer-managed encryption keys (CMEK)**
   - `src/claudestruct/server/crypto.py` — `WrappedDEK` dataclass, `LocalKMSProvider` (KEK from `CLAUDESTRUCT_KEK_PASSPHRASE` via PBKDF2-HMAC-SHA256, random fallback for dev), `fresh_dek` / `encrypt_field` / `decrypt_field` (AES-GCM with AAD-bound row identity), `encode_b64` / `decode_b64` URL-safe helpers, `default_provider()` factory keyed off `CLAUDESTRUCT_KMS_PROVIDER`
   - `Subscription.wrapped_dek_b64` / `wrapped_dek_provider` / `wrapped_dek_key_id` columns store the org-scoped envelope
-  - AWS KMS provider path stubbed (`NotImplementedError`) — abstraction is in place, real SDK integration ships when the merchant story needs it
-  - Tests: `tests/test_crypto.py` (20 cases) — local round-trip, passphrase isolation, AAD binding, wrong-DEK / truncated-blob / wrong-provider rejection, default-provider env wiring
+  - **AWS KMS provider (this PR — C.6)**: `AwsKmsProvider` wraps a 32-byte DEK via `kms.encrypt` / `kms.decrypt` against a configured KMS key id (ARN, alias, or bare). boto3 lazy-imported under the new `[kms-aws]` install extra. Resolved `KeyId` from the encrypt response is recorded on the `WrappedDEK` so a later alias re-pointing doesn't break old ciphertext. All decrypt failure modes (auth, invalid ciphertext, wrong key) collapse to a uniform `KMSError` so an attacker probing decrypt with crafted blobs can't enumerate the failure mode. Returns guard against KMS handing back a `Plaintext` shorter than `DEK_BYTES`. `default_provider()` now resolves `aws` to `AwsKmsProvider` and requires `CLAUDESTRUCT_AWS_KMS_KEY_ID` (no silent fallback). 10 new tests in `tests/test_crypto.py` covering round-trip, alias resolution, dek-length guard, encrypt + decrypt error translation, provider-mismatch + empty-blob + short-plaintext rejection, no-boto3 install hint.
+  - **GCP KMS provider (this PR — symmetric to the AWS path)**: `GcpKmsProvider` wraps a 32-byte DEK via `kms.encrypt` / `kms.decrypt` against a configured key resource (`projects/.../locations/.../keyRings/.../cryptoKeys/...`). google-cloud-kms lazy-imported under the new `[kms-gcp]` install extra; auth uses Application Default Credentials. Same uniform `KMSError` collapse on decrypt failure modes, same short-plaintext guard, same `client=` injection seam for offline tests. `default_provider()` for `CLAUDESTRUCT_KMS_PROVIDER=gcp` requires `CLAUDESTRUCT_GCP_KMS_KEY_NAME`. 8 new tests in `tests/test_crypto.py` mirroring the AWS coverage matrix.
+  - Tests: `tests/test_crypto.py` (30 cases) — local round-trip, passphrase isolation, AAD binding, wrong-DEK / truncated-blob / wrong-provider rejection, AWS round-trip + error translation, default-provider env wiring + per-provider config requirements.
 - [~] **W8.7 — Status page + SLO dashboard** (fleet-wide + per-tenant SLO + API latency middleware shipped; external status page deferred)
   - `src/claudestruct/server/slo.py` folds the `runs` table into rolling 24h / 7d / 30d windows; emits `success_rate`, `error_rate`, p50/p95/p99 of run-start latency (`started_at - created_at`) and duration (`duration_ms` for `done` runs only). Targets (`SUCCESS_RATE_TARGET=0.999`, `P95_RUN_START_MS_TARGET=5000`, `P95_DURATION_MS_TARGET=600000`) live as code-reviewed constants
   - `GET /v1/slo` is unauthenticated like `/healthz` so an external status page can scrape without a service token; output is aggregate (no run IDs / payloads / per-tenant data)
@@ -593,6 +595,77 @@ Ship in roughly this order to maximize compounding value:
 
 ---
 
+## Wave 11 — Local-first GX10 polish (proposed; A.9)
+
+Scattered follow-ups under W10.5 / W10.6 / W10.7 share a coherent
+theme: making the GX10 / local-inference experience first-class.
+Promoting them from per-item bullets to a named wave makes the
+local-first GTM thread visible on the roadmap.
+
+- [x] **W11.1 — Index `--watch` mode** ✅ (already shipped)
+  - `src/claudestruct/indexer.py:watch_index` (Python; injectable
+    `sleep` for tests + `max_iterations` cap) and
+    `claw-squad/src/index/build.ts:watchIndex` (TS).
+    `cs index build --watch [interval]` and
+    `claw-squad index --watch [interval]` both poll-rebuild every
+    N seconds; the `EmbeddingError` path catches transient endpoint
+    outages so a long-running watch survives an Ollama restart.
+    Listed here for cross-reference; no code change needed.
+
+- [x] **W11.2 — Cross-tool index sharing** ✅ (already shipped)
+  - `src/claudestruct/index_io.py:export_to_jsonl` /
+    `import_from_jsonl` ships `cs index export --out shared.jsonl`
+    and `cs index import --in shared.jsonl`. The JSONL format
+    matches the TS-side storage format byte-for-byte (sorted by
+    rel_path, JSON-encoded embeddings) so a Python build can drop
+    a file the TS tool reads, and vice versa. One repo embeds
+    once; both tools share the result.
+
+- [x] **W11.3 — claw-squad `voice transcribe` / `voice run`** ✅ (this PR — via `cs` delegation)
+  - `claw-squad/src/voice.ts:transcribeViaCs(opts)` shells out
+    to `cs voice transcribe` and captures stdout. Single source
+    of truth for the model + language config; users keep one
+    voice setup. Operator without `cs` installed gets a
+    VoiceError pointing at `pip install 'claudestruct[voice]'`.
+  - `claw-squad voice transcribe [--model <name>]
+    [--language <lang>] [--seconds <n>] [--device <n>]
+    [--cs-binary <path>]` — pipe-friendly: `claw-squad voice
+    transcribe | claw-squad run`. Distinct exit codes for
+    "cs not installed" (2), "cs failed" (2), "no speech" (1).
+  - 8 new tests in `claw-squad/tests/voice.test.ts` via
+    spawnSync stub: stdout-trim, full arg threading, csBinary
+    override, ENOENT install hint, non-zero status, empty
+    stderr, empty stdout, default model.
+
+- [x] **W11.4 — Reviewer-side smart-context** ✅ (already shipped under W10.5b)
+  - `claw-squad/src/agents/reviewer-context.ts:readReviewerSiblings`
+    + `agents/reviewer.ts:siblingContext` + orchestrator wiring
+    at `orchestrator.ts:1060` give the Reviewer top-K
+    semantically-relevant sibling files alongside the diff,
+    minus paths the diff already covers (avoids duplicate-paste
+    token waste). Failure of the index lookup falls back to
+    "Reviewer sees diff only". 11 cases in
+    `claw-squad/tests/reviewer-context.test.ts`. Listed here
+    for cross-reference; no code change needed in this wave.
+
+- [x] **W11.5 — Verdict-aware dataset filter** ✅ (this PR)
+  - `walkRunIo({reasons: Set<string>})` + `claw-squad dataset
+    export --review-decision approve` flag. Filter is per-file
+    (not per-event): the file's `run-end` reason decides
+    whether ANY of its rows are emitted. In-flight runs (no
+    `run-end`, e.g. crashed daemon) are EXCLUDED when the
+    filter is active — better to drop a partial row than to
+    silently learn from incomplete work. 6 new tests in
+    `claw-squad/tests/dataset.test.ts` (happy path, dropped
+    reason, in-flight drop, multi-reason set, no-filter
+    back-compat).
+
+The wave's success criterion: a local-only operator can cycle
+edit → review → ship without ever pinging the cloud, with the
+same UX as the cloud path.
+
+---
+
 ## Post-roadmap PRs (selected from R/F candidate list)
 
 - [~] **R2 + F1 + F8 — orchestrator integration test, MCP server, cross-tool dashboard**
@@ -612,6 +685,12 @@ Ship in roughly this order to maximize compounding value:
 
 ## Last Update
 
+- 2026-05-10 — C.1 (step 3): extract clone_push.py from `github_app/__init__.py`:
+  - Pulls `_run_git`, `_git_credential_approve`, `_prepare_repo_push`, `_push_branch_via_git`, and the `open_pr_as_bot` orchestrator out of `__init__.py` into a focused `github_app/clone_push.py` (317 LOC). `__init__.py` shrinks from 1058 → 784 LOC.
+  - Symbols re-exported from `__init__.py` via `from .clone_push import …` so `from claudestruct.server.github_app import open_pr_as_bot` (worker.py) keeps resolving — zero call-site churn.
+  - Lazy imports inside `_prepare_repo_push` (for `get_ref_sha`) and `open_pr_as_bot` (for `mint_app_jwt` + `create_pull_request`) dodge the circular dep on the still-loading parent package. Type hints reference `GitHubAppConfig` / `InstallationTokenCache` via `TYPE_CHECKING` so static checkers see the symbols without running the import at module-load.
+  - Removed now-unused `shutil` / `subprocess` / `tempfile` / `pathlib.Path` imports from `__init__.py`.
+  - 821 passed, 3 skipped (unchanged from step 2 — same suite, exact same outcomes); ruff clean. Continues the C.1 split sequence; remaining cuts (`auth.py` for JWT minting + `InstallationTokenCache`, `comments.py` for `post_pr_comment` + `post_ack_comment` + `format_verdict_body`) are mechanical follow-ups on the same pattern.
 - 2026-05-01 — W10.4 (local prompt-result cache) wiring ready for PR push:
   - Storage primitives shipped earlier as W9.4; this PR completes the call-path wiring + provider-aware policy + CLI flags
   - `cache_key` now includes `effort` + `max_tokens` so quality knobs don't collide on replay; `is_enabled_for(provider, override)` defaults to ON for openai-compat / OFF for Anthropic (auto) but obeys env + per-run overrides

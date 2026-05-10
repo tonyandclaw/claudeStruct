@@ -179,6 +179,189 @@ class LocalKMSProvider:
             raise KMSError(f"unwrap auth failed: {exc.__class__.__name__}") from exc
 
 
+# --- AWS KMS provider (W5.4 / C.6 follow-up) ------------------------
+#
+# Wraps a 32-byte DEK under the configured KMS key (ARN or alias).
+# boto3 is lazy-imported under the new ``[kms-aws]`` extra so the
+# default install stays lean. Auth uses the standard boto3 chain
+# (env / shared creds / EC2 IAM / EKS IRSA), so an AWS-hosted
+# runtime needs no extra config.
+#
+# AWS KMS has a 4 KB plaintext limit on Encrypt; a 32-byte DEK is
+# trivially under that.
+
+
+@dataclass
+class AwsKmsProvider:
+    """KMS provider backed by AWS KMS Encrypt / Decrypt.
+
+    Configure via ``CLAUDESTRUCT_AWS_KMS_KEY_ID`` (ARN, alias, or
+    bare key id) + ``AWS_REGION`` (boto3 default chain).
+
+    The wrapped blob carries the ciphertext bytes returned by
+    ``kms.encrypt`` plus the key id used at wrap time. ``unwrap``
+    re-uses ``KeyId`` from the wrapped record so an alias rotation
+    doesn't break old ciphertext (KMS will look up the actual key
+    via the alias, even if the alias points elsewhere now).
+    """
+
+    region_name: str
+    key_id: str
+    client: object | None = None  # injected for tests
+    name: str = "aws"
+
+    def _client(self) -> object:
+        if self.client is not None:
+            return self.client
+        try:
+            import boto3  # type: ignore
+        except ImportError as exc:
+            raise KMSError(
+                "AwsKmsProvider requires boto3; "
+                "install with `pip install claudestruct[kms-aws]`"
+            ) from exc
+        return boto3.client("kms", region_name=self.region_name)
+
+    def wrap(self, dek: bytes) -> WrappedDEK:
+        if len(dek) != DEK_BYTES:
+            raise KMSError(f"DEK must be {DEK_BYTES} bytes, got {len(dek)}")
+        client = self._client()
+        try:
+            resp = client.encrypt(KeyId=self.key_id, Plaintext=dek)  # type: ignore[attr-defined]
+        except Exception as exc:  # noqa: BLE001
+            raise KMSError(f"AWS KMS encrypt failed: {type(exc).__name__}") from exc
+        ciphertext = resp.get("CiphertextBlob")
+        if not ciphertext:
+            raise KMSError("AWS KMS encrypt returned empty CiphertextBlob")
+        # KMS resp may include the canonical KeyId (resolved alias →
+        # ARN). Prefer that over our config so the wrapped record
+        # survives alias re-pointing.
+        key_id = resp.get("KeyId", self.key_id)
+        return WrappedDEK(
+            provider=self.name, key_id=key_id, wrapped_bytes=bytes(ciphertext),
+        )
+
+    def unwrap(self, wrapped: WrappedDEK) -> bytes:
+        if wrapped.provider != self.name:
+            raise KMSError(
+                f"provider mismatch: have {self.name!r}, blob is {wrapped.provider!r}",
+            )
+        if not wrapped.wrapped_bytes:
+            raise KMSError("wrapped blob is empty")
+        client = self._client()
+        try:
+            resp = client.decrypt(  # type: ignore[attr-defined]
+                CiphertextBlob=wrapped.wrapped_bytes,
+                KeyId=wrapped.key_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            # AWS distinguishes IncorrectKeyException, InvalidCiphertextException,
+            # AccessDeniedException, etc. We wrap them all uniformly as
+            # KMSError to avoid leaking the specific failure mode upstream
+            # (an attacker probing decrypt with crafted blobs shouldn't
+            # learn which kind of error we hit).
+            raise KMSError(f"AWS KMS decrypt failed: {type(exc).__name__}") from exc
+        plaintext = resp.get("Plaintext")
+        if not plaintext or len(plaintext) != DEK_BYTES:
+            raise KMSError(
+                f"AWS KMS returned unexpected plaintext length "
+                f"(expected {DEK_BYTES}, got {len(plaintext) if plaintext else 0})",
+            )
+        return bytes(plaintext)
+
+
+# --- GCP KMS provider (W5.4 / C.6 follow-up) ------------------------
+#
+# google-cloud-kms is lazy-imported under a new ``[kms-gcp]`` extra.
+# Auth uses Application Default Credentials (env / metadata service /
+# service account JSON), so a GKE-hosted runtime needs no extra
+# config. The KMS resource path is constructed from
+# (project, location, key_ring, key) so the operator only needs to
+# set ``CLAUDESTRUCT_GCP_KMS_KEY_NAME`` to the full resource path.
+
+
+@dataclass
+class GcpKmsProvider:
+    """KMS provider backed by Google Cloud KMS.
+
+    Configure via ``CLAUDESTRUCT_GCP_KMS_KEY_NAME`` (full resource
+    path: ``projects/.../locations/.../keyRings/.../cryptoKeys/...``).
+    Auth via Application Default Credentials.
+
+    The wrapped blob carries the ciphertext bytes returned by the
+    encrypt RPC. Unlike AWS, GCP KMS doesn't echo the resolved key
+    name on the response, so we record the configured one. Key
+    rotation is handled server-side by GCP — the same key resource
+    auto-resolves to the active version for decrypt.
+    """
+
+    key_name: str
+    client: object | None = None  # injected for tests
+    name: str = "gcp"
+
+    def _client(self) -> object:
+        if self.client is not None:
+            return self.client
+        try:
+            from google.cloud import kms  # type: ignore
+        except ImportError as exc:
+            raise KMSError(
+                "GcpKmsProvider requires google-cloud-kms; "
+                "install with `pip install claudestruct[kms-gcp]`"
+            ) from exc
+        return kms.KeyManagementServiceClient()
+
+    def wrap(self, dek: bytes) -> WrappedDEK:
+        if len(dek) != DEK_BYTES:
+            raise KMSError(f"DEK must be {DEK_BYTES} bytes, got {len(dek)}")
+        client = self._client()
+        try:
+            resp = client.encrypt(  # type: ignore[attr-defined]
+                request={"name": self.key_name, "plaintext": dek},
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise KMSError(
+                f"GCP KMS encrypt failed: {type(exc).__name__}",
+            ) from exc
+        ciphertext = getattr(resp, "ciphertext", None)
+        if not ciphertext:
+            raise KMSError("GCP KMS encrypt returned empty ciphertext")
+        return WrappedDEK(
+            provider=self.name,
+            key_id=self.key_name,
+            wrapped_bytes=bytes(ciphertext),
+        )
+
+    def unwrap(self, wrapped: WrappedDEK) -> bytes:
+        if wrapped.provider != self.name:
+            raise KMSError(
+                f"provider mismatch: have {self.name!r}, blob is {wrapped.provider!r}",
+            )
+        if not wrapped.wrapped_bytes:
+            raise KMSError("wrapped blob is empty")
+        client = self._client()
+        try:
+            resp = client.decrypt(  # type: ignore[attr-defined]
+                request={
+                    "name": wrapped.key_id,
+                    "ciphertext": wrapped.wrapped_bytes,
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            # Same error-class collapse as AWS: don't let an attacker
+            # probing decrypt enumerate the failure mode.
+            raise KMSError(
+                f"GCP KMS decrypt failed: {type(exc).__name__}",
+            ) from exc
+        plaintext = getattr(resp, "plaintext", None)
+        if not plaintext or len(plaintext) != DEK_BYTES:
+            raise KMSError(
+                f"GCP KMS returned unexpected plaintext length "
+                f"(expected {DEK_BYTES}, got {len(plaintext) if plaintext else 0})",
+            )
+        return bytes(plaintext)
+
+
 def default_provider(*, allow_random_kek: bool = False) -> KMSProvider:
     """Build the provider selected by env.
 
@@ -198,12 +381,23 @@ def default_provider(*, allow_random_kek: bool = False) -> KMSProvider:
             )
         return LocalKMSProvider()
     if name == "aws":
-        # Lazy import: boto3 is heavy and the OSS install shouldn't
-        # carry it. Ship it via `pip install 'claudestruct[hosted]'`
-        # (extra not yet defined; landing alongside the live AWS path).
-        raise NotImplementedError("AWS KMS provider lands in a follow-up PR")
+        key_id = os.environ.get("CLAUDESTRUCT_AWS_KMS_KEY_ID", "").strip()
+        if not key_id:
+            raise KMSError(
+                "AWS KMS provider requires CLAUDESTRUCT_AWS_KMS_KEY_ID "
+                "(ARN, alias/<name>, or bare key id).",
+            )
+        region = os.environ.get("AWS_REGION", "us-east-1")
+        return AwsKmsProvider(region_name=region, key_id=key_id)
     if name == "gcp":
-        raise NotImplementedError("GCP KMS provider lands in a follow-up PR")
+        key_name = os.environ.get("CLAUDESTRUCT_GCP_KMS_KEY_NAME", "").strip()
+        if not key_name:
+            raise KMSError(
+                "GCP KMS provider requires CLAUDESTRUCT_GCP_KMS_KEY_NAME "
+                "(full resource path: projects/<p>/locations/<l>/"
+                "keyRings/<r>/cryptoKeys/<k>).",
+            )
+        return GcpKmsProvider(key_name=key_name)
     raise KMSError(f"unknown CLAUDESTRUCT_KMS_PROVIDER: {name!r}")
 
 
