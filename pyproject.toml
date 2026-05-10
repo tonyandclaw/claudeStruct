@@ -98,6 +98,12 @@ secrets-aws = [
 kms-aws = [
   "boto3>=1.34",
 ]
+# `pip install claudestruct[kms-gcp]` enables the GCP KMS provider.
+# google-cloud-kms is the official Google client; auth uses
+# Application Default Credentials.
+kms-gcp = [
+  "google-cloud-kms>=2.20",
+]
 # `pip install claudestruct[secrets-vault]` enables the HashiCorp
 # Vault KV-v2 backend. hvac is light but unrelated to most installs.
 secrets-vault = [

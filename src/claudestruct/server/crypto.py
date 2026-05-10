@@ -270,6 +270,98 @@ class AwsKmsProvider:
         return bytes(plaintext)
 
 
+# --- GCP KMS provider (W5.4 / C.6 follow-up) ------------------------
+#
+# google-cloud-kms is lazy-imported under a new ``[kms-gcp]`` extra.
+# Auth uses Application Default Credentials (env / metadata service /
+# service account JSON), so a GKE-hosted runtime needs no extra
+# config. The KMS resource path is constructed from
+# (project, location, key_ring, key) so the operator only needs to
+# set ``CLAUDESTRUCT_GCP_KMS_KEY_NAME`` to the full resource path.
+
+
+@dataclass
+class GcpKmsProvider:
+    """KMS provider backed by Google Cloud KMS.
+
+    Configure via ``CLAUDESTRUCT_GCP_KMS_KEY_NAME`` (full resource
+    path: ``projects/.../locations/.../keyRings/.../cryptoKeys/...``).
+    Auth via Application Default Credentials.
+
+    The wrapped blob carries the ciphertext bytes returned by the
+    encrypt RPC. Unlike AWS, GCP KMS doesn't echo the resolved key
+    name on the response, so we record the configured one. Key
+    rotation is handled server-side by GCP — the same key resource
+    auto-resolves to the active version for decrypt.
+    """
+
+    key_name: str
+    client: object | None = None  # injected for tests
+    name: str = "gcp"
+
+    def _client(self) -> object:
+        if self.client is not None:
+            return self.client
+        try:
+            from google.cloud import kms  # type: ignore
+        except ImportError as exc:
+            raise KMSError(
+                "GcpKmsProvider requires google-cloud-kms; "
+                "install with `pip install claudestruct[kms-gcp]`"
+            ) from exc
+        return kms.KeyManagementServiceClient()
+
+    def wrap(self, dek: bytes) -> WrappedDEK:
+        if len(dek) != DEK_BYTES:
+            raise KMSError(f"DEK must be {DEK_BYTES} bytes, got {len(dek)}")
+        client = self._client()
+        try:
+            resp = client.encrypt(  # type: ignore[attr-defined]
+                request={"name": self.key_name, "plaintext": dek},
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise KMSError(
+                f"GCP KMS encrypt failed: {type(exc).__name__}",
+            ) from exc
+        ciphertext = getattr(resp, "ciphertext", None)
+        if not ciphertext:
+            raise KMSError("GCP KMS encrypt returned empty ciphertext")
+        return WrappedDEK(
+            provider=self.name,
+            key_id=self.key_name,
+            wrapped_bytes=bytes(ciphertext),
+        )
+
+    def unwrap(self, wrapped: WrappedDEK) -> bytes:
+        if wrapped.provider != self.name:
+            raise KMSError(
+                f"provider mismatch: have {self.name!r}, blob is {wrapped.provider!r}",
+            )
+        if not wrapped.wrapped_bytes:
+            raise KMSError("wrapped blob is empty")
+        client = self._client()
+        try:
+            resp = client.decrypt(  # type: ignore[attr-defined]
+                request={
+                    "name": wrapped.key_id,
+                    "ciphertext": wrapped.wrapped_bytes,
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            # Same error-class collapse as AWS: don't let an attacker
+            # probing decrypt enumerate the failure mode.
+            raise KMSError(
+                f"GCP KMS decrypt failed: {type(exc).__name__}",
+            ) from exc
+        plaintext = getattr(resp, "plaintext", None)
+        if not plaintext or len(plaintext) != DEK_BYTES:
+            raise KMSError(
+                f"GCP KMS returned unexpected plaintext length "
+                f"(expected {DEK_BYTES}, got {len(plaintext) if plaintext else 0})",
+            )
+        return bytes(plaintext)
+
+
 def default_provider(*, allow_random_kek: bool = False) -> KMSProvider:
     """Build the provider selected by env.
 
@@ -298,11 +390,14 @@ def default_provider(*, allow_random_kek: bool = False) -> KMSProvider:
         region = os.environ.get("AWS_REGION", "us-east-1")
         return AwsKmsProvider(region_name=region, key_id=key_id)
     if name == "gcp":
-        # GCP KMS uses a different SDK (google-cloud-kms) and a
-        # different auth model (service account JSON / workload
-        # identity). Lands in a follow-up alongside the GCP-side
-        # secrets adapter.
-        raise NotImplementedError("GCP KMS provider lands in a follow-up PR")
+        key_name = os.environ.get("CLAUDESTRUCT_GCP_KMS_KEY_NAME", "").strip()
+        if not key_name:
+            raise KMSError(
+                "GCP KMS provider requires CLAUDESTRUCT_GCP_KMS_KEY_NAME "
+                "(full resource path: projects/<p>/locations/<l>/"
+                "keyRings/<r>/cryptoKeys/<k>).",
+            )
+        return GcpKmsProvider(key_name=key_name)
     raise KMSError(f"unknown CLAUDESTRUCT_KMS_PROVIDER: {name!r}")
 
 

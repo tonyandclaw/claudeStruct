@@ -108,11 +108,23 @@ def test_default_provider_aws_returns_aws_provider(monkeypatch):
 
 
 def test_default_provider_gcp_still_unimplemented(monkeypatch):
-    """GCP KMS lands in a follow-up — the explicit NotImplementedError
-    keeps the deploy script honest."""
+    """GCP without the resource-name env is a hard error — silent
+    fallback would mask a misconfigured prod deploy."""
     monkeypatch.setenv("CLAUDESTRUCT_KMS_PROVIDER", "gcp")
-    with pytest.raises(NotImplementedError, match="GCP"):
+    monkeypatch.delenv("CLAUDESTRUCT_GCP_KMS_KEY_NAME", raising=False)
+    with pytest.raises(crypto_mod.KMSError, match="CLAUDESTRUCT_GCP_KMS_KEY_NAME"):
         crypto_mod.default_provider()
+
+
+def test_default_provider_gcp_returns_gcp_provider(monkeypatch):
+    monkeypatch.setenv("CLAUDESTRUCT_KMS_PROVIDER", "gcp")
+    monkeypatch.setenv(
+        "CLAUDESTRUCT_GCP_KMS_KEY_NAME",
+        "projects/p/locations/global/keyRings/r/cryptoKeys/k",
+    )
+    p = crypto_mod.default_provider()
+    assert p.name == "gcp"
+    assert p.key_name.endswith("/cryptoKeys/k")
 
 
 def test_default_provider_unknown_name_raises(monkeypatch):
@@ -335,3 +347,139 @@ def test_b64_url_safe_no_padding():
     URL-safe contexts and DB column round-trips that strip whitespace."""
     blob = b"\xff" * 31  # length that would normally pad
     assert "=" not in crypto_mod.encode_b64(blob)
+
+
+# --- GcpKmsProvider --------------------------------------------------
+
+
+class _FakeGcpKmsClient:
+    """Mimics google.cloud.kms.KeyManagementServiceClient.
+
+    Stores `(name, plaintext) -> ciphertext` so encrypt + decrypt
+    can round-trip without real crypto. Inverts bytes for
+    "ciphertext" so a Plaintext/ciphertext swap fails the test.
+    """
+
+    class _Resp:
+        def __init__(self, *, ciphertext: bytes | None = None,
+                     plaintext: bytes | None = None) -> None:
+            self.ciphertext = ciphertext
+            self.plaintext = plaintext
+
+    def __init__(self, *, encrypt_raises=False, decrypt_raises=False):
+        self._store: dict[bytes, tuple[str, bytes]] = {}
+        self.encrypt_raises = encrypt_raises
+        self.decrypt_raises = decrypt_raises
+        self.calls: list[tuple[str, dict]] = []
+
+    def encrypt(self, *, request: dict):
+        self.calls.append(("encrypt", request))
+        if self.encrypt_raises:
+            raise RuntimeError("simulated GCP error")
+        plaintext = request["plaintext"]
+        ct = bytes(b ^ 0xAA for b in plaintext) + b"|" + request["name"].encode()
+        self._store[ct] = (request["name"], bytes(plaintext))
+        return self._Resp(ciphertext=ct)
+
+    def decrypt(self, *, request: dict):
+        self.calls.append(("decrypt", request))
+        if self.decrypt_raises:
+            raise RuntimeError("simulated GCP error")
+        rec = self._store.get(request["ciphertext"])
+        if rec is None:
+            raise RuntimeError("InvalidCiphertext")
+        recorded_name, plaintext = rec
+        if request["name"] != recorded_name:
+            raise RuntimeError("PermissionDenied")
+        return self._Resp(plaintext=plaintext)
+
+
+def _gcp_provider(client=None):
+    return crypto_mod.GcpKmsProvider(
+        key_name="projects/p/locations/global/keyRings/r/cryptoKeys/k",
+        client=client,
+    )
+
+
+def test_gcp_kms_round_trip():
+    fake = _FakeGcpKmsClient()
+    p = _gcp_provider(client=fake)
+    dek = b"\x05" * crypto_mod.DEK_BYTES
+    wrapped = p.wrap(dek)
+    assert wrapped.provider == "gcp"
+    assert wrapped.key_id == p.key_name
+    out = p.unwrap(wrapped)
+    assert out == dek
+
+
+def test_gcp_kms_rejects_wrong_dek_length():
+    fake = _FakeGcpKmsClient()
+    p = _gcp_provider(client=fake)
+    with pytest.raises(crypto_mod.KMSError, match="DEK must be"):
+        p.wrap(b"\x00" * 8)
+
+
+def test_gcp_kms_wrap_translates_gcp_error():
+    fake = _FakeGcpKmsClient(encrypt_raises=True)
+    p = _gcp_provider(client=fake)
+    with pytest.raises(crypto_mod.KMSError, match="encrypt failed"):
+        p.wrap(b"\x06" * crypto_mod.DEK_BYTES)
+
+
+def test_gcp_kms_unwrap_translates_gcp_error():
+    fake = _FakeGcpKmsClient()
+    p = _gcp_provider(client=fake)
+    fake.decrypt_raises = True
+    with pytest.raises(crypto_mod.KMSError, match="decrypt failed"):
+        p.unwrap(crypto_mod.WrappedDEK(
+            provider="gcp", key_id=p.key_name, wrapped_bytes=b"garbage",
+        ))
+
+
+def test_gcp_kms_unwrap_rejects_wrong_provider_blob():
+    fake = _FakeGcpKmsClient()
+    p = _gcp_provider(client=fake)
+    with pytest.raises(crypto_mod.KMSError, match="provider mismatch"):
+        p.unwrap(crypto_mod.WrappedDEK(
+            provider="aws", key_id="x", wrapped_bytes=b"y" * 32,
+        ))
+
+
+def test_gcp_kms_unwrap_rejects_empty_blob():
+    fake = _FakeGcpKmsClient()
+    p = _gcp_provider(client=fake)
+    with pytest.raises(crypto_mod.KMSError, match="empty"):
+        p.unwrap(crypto_mod.WrappedDEK(
+            provider="gcp", key_id=p.key_name, wrapped_bytes=b"",
+        ))
+
+
+def test_gcp_kms_no_sdk_raises_kmserror(monkeypatch):
+    """Without `client=` and without google-cloud-kms installed, the
+    provider surfaces a clear install hint."""
+    p = crypto_mod.GcpKmsProvider(
+        key_name="projects/p/locations/global/keyRings/r/cryptoKeys/k",
+    )
+    # The lazy import is `from google.cloud import kms` — mark the
+    # `google.cloud` module as None so the import fails.
+    import sys
+    monkeypatch.setitem(sys.modules, "google.cloud", None)
+    with pytest.raises(crypto_mod.KMSError, match="claudestruct\\[kms-gcp\\]"):
+        p.wrap(b"\x00" * crypto_mod.DEK_BYTES)
+
+
+def test_gcp_kms_unwrap_truncated_response_is_error():
+    """Truncated `Plaintext` from the server must raise rather than
+    return a too-short DEK that would corrupt downstream
+    ciphertext."""
+
+    class _ShortPlaintextClient(_FakeGcpKmsClient):
+        def decrypt(self, *, request):
+            return self._Resp(plaintext=b"\x00" * 8)
+
+    fake = _ShortPlaintextClient()
+    p = _gcp_provider(client=fake)
+    with pytest.raises(crypto_mod.KMSError, match="unexpected plaintext length"):
+        p.unwrap(crypto_mod.WrappedDEK(
+            provider="gcp", key_id=p.key_name, wrapped_bytes=b"any",
+        ))
