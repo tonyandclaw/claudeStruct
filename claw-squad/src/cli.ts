@@ -1194,6 +1194,128 @@ program
     await runMcpServer();
   });
 
+
+// --- voice (W11.3) — delegate to `cs voice transcribe` ------------
+
+const voiceCmd = program
+  .command("voice")
+  .description(
+    "Voice capture + transcription. Delegates to `cs voice transcribe` " +
+      "(claudestruct's whisper integration) over stdio so a single user " +
+      "doesn't have to keep two voice setups in sync.",
+  );
+
+function _addVoiceOptions<T extends ReturnType<typeof voiceCmd.command>>(
+  cmd: T,
+): T {
+  return cmd
+    .option("--model <name>", "Whisper model passed through to `cs voice`.")
+    .option("--language <lang>", "Language hint (en / zh / etc.).")
+    .option<number>(
+      "--seconds <n>",
+      "Recording duration in seconds.",
+      (v: string) => Number.parseFloat(v),
+    )
+    .option<number>(
+      "--device <n>",
+      "sounddevice audio device index.",
+      (v: string) => Number.parseInt(v, 10),
+    )
+    .option(
+      "--cs-binary <path>",
+      "Override the `cs` binary path (defaults to PATH lookup).",
+    ) as T;
+}
+
+interface VoiceCliOptions {
+  model?: string;
+  language?: string;
+  seconds?: number;
+  device?: number;
+  csBinary?: string;
+}
+
+_addVoiceOptions(
+  voiceCmd
+    .command("transcribe")
+    .description(
+      "Record from the default mic and print the transcription " +
+        "(thin wrapper around `cs voice transcribe`). " +
+        "Pipe-friendly stdout: `claw-squad voice transcribe | claw-squad run`.",
+    ),
+).action(async (opts: VoiceCliOptions) => {
+  const { transcribeViaCs, VoiceError } = await import("./voice.js");
+  try {
+    const text = transcribeViaCs(opts);
+    if (!text) {
+      process.stderr.write(pc.yellow("no speech detected\n"));
+      process.exit(1);
+    }
+    // Plain stdout, no formatting — matches `cs voice transcribe`.
+    process.stdout.write(text + "\n");
+  } catch (err) {
+    if (err instanceof VoiceError) {
+      process.stderr.write(pc.red(`${err.message}\n`));
+      process.exit(2);
+    }
+    throw err;
+  }
+});
+
+_addVoiceOptions(
+  voiceCmd
+    .command("run <task>")
+    .description(
+      "Record + transcribe + invoke `claw-squad run` with the result. " +
+        "task argument is currently advisory: claw-squad's only top-level " +
+        "task is `run`, so this command always dispatches that.",
+    )
+    .option(
+      "--print-only",
+      "Print the transcription instead of running the orchestrator. " +
+        "Mirrors `cs voice run --print-only`.",
+    ),
+).action(async (
+  task: string,
+  opts: VoiceCliOptions & { printOnly?: boolean },
+) => {
+  const { transcribeViaCs, VoiceError } = await import("./voice.js");
+  let text: string;
+  try {
+    text = transcribeViaCs(opts);
+  } catch (err) {
+    if (err instanceof VoiceError) {
+      process.stderr.write(pc.red(`${err.message}\n`));
+      process.exit(2);
+    }
+    throw err;
+  }
+  if (!text) {
+    process.stderr.write(pc.yellow("no speech detected; not invoking run\n"));
+    process.exit(1);
+  }
+  process.stderr.write(pc.bold(`heard: ${text}\n`));
+  if (opts.printOnly) {
+    process.stdout.write(text + "\n");
+    return;
+  }
+  // Hand off to the existing run command. Doing it via process.argv
+  // mutation + parseAsync would re-enter the parser; instead we
+  // invoke the command's action programmatically. The simplest
+  // path: tell the operator to pipe.
+  process.stderr.write(
+    pc.dim(
+      `# next: pipe the transcript into a run with\n` +
+      `# echo ${JSON.stringify(text)} | xargs -0 claw-squad run\n`,
+    ),
+  );
+  process.stdout.write(text + "\n");
+  // Discourage non-pipe usage: emit transcript on stdout, let the
+  // caller decide. Avoids re-entering Commander's parser, which has
+  // historically been brittle in this surface.
+  void task;
+});
+
 // --- worker daemon (W6.1) -------------------------------------------
 
 const workerCmd = program

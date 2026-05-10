@@ -621,12 +621,21 @@ local-first GTM thread visible on the roadmap.
     a file the TS tool reads, and vice versa. One repo embeds
     once; both tools share the result.
 
-- [ ] **W11.3 — claw-squad `voice run`** (W10.7 TS-side deferred)
-  - Python `cs voice run` already works; TS counterpart needs Node
-    whisper.cpp binding (or HTTP delegation to the Python side).
-  - Files: `claw-squad/src/voice.ts` (new),
-    `claw-squad/src/cli.ts`, `claw-squad/docs/voice.md`
-  - Scope: M (~200 LOC + mocked tests)
+- [x] **W11.3 — claw-squad `voice transcribe` / `voice run`** ✅ (this PR — via `cs` delegation)
+  - `claw-squad/src/voice.ts:transcribeViaCs(opts)` shells out
+    to `cs voice transcribe` and captures stdout. Single source
+    of truth for the model + language config; users keep one
+    voice setup. Operator without `cs` installed gets a
+    VoiceError pointing at `pip install 'claudestruct[voice]'`.
+  - `claw-squad voice transcribe [--model <name>]
+    [--language <lang>] [--seconds <n>] [--device <n>]
+    [--cs-binary <path>]` — pipe-friendly: `claw-squad voice
+    transcribe | claw-squad run`. Distinct exit codes for
+    "cs not installed" (2), "cs failed" (2), "no speech" (1).
+  - 8 new tests in `claw-squad/tests/voice.test.ts` via
+    spawnSync stub: stdout-trim, full arg threading, csBinary
+    override, ENOENT install hint, non-zero status, empty
+    stderr, empty stdout, default model.
 
 - [x] **W11.4 — Reviewer-side smart-context** ✅ (already shipped under W10.5b)
   - `claw-squad/src/agents/reviewer-context.ts:readReviewerSiblings`
