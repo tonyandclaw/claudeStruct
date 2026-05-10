@@ -1079,6 +1079,14 @@ datasetCmd
     "--since <date>",
     "Filter to events on or after this date (YYYY-MM-DD or ISO 8601).",
   )
+  .option(
+    "--review-decision <decision>",
+    "W11.5: include only runs whose review verdict matches. " +
+      "Pass `approve` to learn from runs the Reviewer accepted " +
+      "(reason=complete); pass `any` (default) to keep every run " +
+      "regardless of outcome.",
+    "any",
+  )
   .option<"alpaca" | "chat">(
     "--format <fmt>",
     "Output schema: 'alpaca' (default) = {instruction,input,output}; 'chat' = {messages: [...]}",
@@ -1098,6 +1106,7 @@ datasetCmd
       root: string;
       role?: string;
       since?: string;
+      reviewDecision: string;
       format: "alpaca" | "chat";
     }) => {
       const { exportDataset, parseSince } = await import("./runs/dataset.js");
@@ -1132,9 +1141,28 @@ datasetCmd
         since = parsed;
       }
 
+      // W11.5 — `--review-decision approve` translates to the
+      // verdict-aware filter (only runs that ended in
+      // reason=complete). `any` (the default) leaves the filter
+      // unset so every run-end reason is included.
+      let reasons: Set<string> | undefined;
+      if (opts.reviewDecision === "approve") {
+        reasons = new Set(["complete"]);
+      } else if (opts.reviewDecision !== "any") {
+        console.error(
+          pc.red(
+            `--review-decision must be 'approve' or 'any'; got ${
+              opts.reviewDecision
+            }`,
+          ),
+        );
+        process.exit(2);
+      }
+
       const stats = exportDataset(opts.root, opts.out, {
         role,
         since,
+        reasons,
         format: opts.format,
       });
 

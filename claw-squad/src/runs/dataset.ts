@@ -106,6 +106,19 @@ export interface WalkFilters {
   /** ISO 8601 cutoff. Events with no parseable `ts` are kept — better
    *  to over-include than silently drop. */
   since?: Date;
+  /**
+   * W11.5 — verdict-aware filter. When set, restrict to runs whose
+   * `run-end` event has the matching `reason`. The orchestrator
+   * only reaches `reason="complete"` when the Reviewer approved at
+   * some point, so `reasons={"complete"}` is the standard
+   * "include only review-approved runs" filter for fine-tuning
+   * datasets where you don't want to learn from rolled-back work.
+   *
+   * Runs with no `run-end` event (in-flight, crashed) are
+   * EXCLUDED when this filter is set — better to drop a row than
+   * to silently include partial work.
+   */
+  reasons?: Set<string>;
 }
 
 function eventIsRunIo(
@@ -114,11 +127,25 @@ function eventIsRunIo(
   return e.type === "run-io";
 }
 
+
+function eventIsRunEnd(
+  e: RunLogEvent,
+): e is Extract<RunLogEvent, { type: "run-end" }> {
+  return e.type === "run-end";
+}
+
 /**
  * Yield every `run-io` event under `<repoRoot>/.claw-squad/runs/`,
  * filtered by the given criteria. A single corrupt JSONL line is
  * skipped (loadOneRun already does this); a missing runs dir means
  * empty result, not an error.
+ *
+ * When `filters.reasons` is set, the file is read in two passes:
+ * first to find the `run-end` event (typically the last line) and
+ * decide whether to include the file at all; second to emit the
+ * `run-io` rows. Most run files are small enough that the
+ * double-read is cheaper than threading a "buffered" mode through
+ * the existing single-pass shape.
  */
 export function* walkRunIo(
   repoRoot: string,
@@ -136,14 +163,44 @@ export function* walkRunIo(
     } catch {
       continue;
     }
-    for (const line of raw.split("\n")) {
-      if (line.length === 0) continue;
-      let parsed: RunLogEvent;
-      try {
-        parsed = JSON.parse(line) as RunLogEvent;
-      } catch {
+    // Pre-pass: when the verdict filter is active, find the
+    // `run-end` reason and skip files that don't match. We
+    // iterate through the file once for parsing; the IO rows are
+    // collected only if the reason check passes (or no filter).
+    let parsedLines: RunLogEvent[];
+    if (filters.reasons) {
+      parsedLines = [];
+      let endReason: string | undefined;
+      for (const line of raw.split("\n")) {
+        if (line.length === 0) continue;
+        let parsed: RunLogEvent;
+        try {
+          parsed = JSON.parse(line) as RunLogEvent;
+        } catch {
+          continue;
+        }
+        parsedLines.push(parsed);
+        if (eventIsRunEnd(parsed)) {
+          endReason = parsed.reason;
+        }
+      }
+      if (endReason === undefined || !filters.reasons.has(endReason)) {
+        // File didn't end (in-flight, crashed) or ended with a
+        // non-matching reason — drop every row from it.
         continue;
       }
+    } else {
+      parsedLines = [];
+      for (const line of raw.split("\n")) {
+        if (line.length === 0) continue;
+        try {
+          parsedLines.push(JSON.parse(line) as RunLogEvent);
+        } catch {
+          continue;
+        }
+      }
+    }
+    for (const parsed of parsedLines) {
       if (!eventIsRunIo(parsed)) continue;
       if (filters.role && parsed.role !== filters.role) continue;
       if (filters.since) {

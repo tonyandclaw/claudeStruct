@@ -317,7 +317,8 @@ Goal: distribution. Make the product discoverable, easy to install, and easy to 
   - Auto-discovery: scan `<repoRoot>/node_modules/claudestruct-plugin-*`, resolve entry via `package.json` `main` / `exports["."]` / fallbacks, dynamic-import via `pathToFileURL`, validate with `isPlugin()`, merge with deterministic dedup (first plugin wins for duplicate names, surfaced as a warning).
   - Plugins contribute new subagents and skills only — Planner/Coder/Reviewer roles stay core (a plugin flipping the orchestrator state machine breaks every other plugin).
   - Tests: `claw-squad/tests/plugins.test.ts` (20 cases) — `isPlugin` validation matrix, prefix discovery + non-dir filtering, CJS + ESM loaders, missing entry / bad shape / wrong apiVersion warnings, merge dedup of plugins/subagents/skills, end-to-end `loadPluginsFromRepo`
-  - Pending: PyPI-side equivalent (claudestruct plugins), published `claudestruct-plugin-sdk` package on npm
+  - **Python plugin SDK (this PR — W7.4 mirror)**: `src/claudestruct/plugin_sdk/` ships `Plugin` / `SubagentContribution` / `SkillContribution` dataclasses, `PLUGIN_API_VERSION=1` (matches the TS side so plugin authors carry one mental model), `is_plugin()` validator, `merge_plugins()` with the same dedup rules as TS (first-wins on duplicate plugin name / subagent name / skill id, all logged), and `discover_plugins()` reading the `claudestruct.plugins` entry-point group. A broken third-party package logs and is skipped — one bad install doesn't block the rest. Plugins declare themselves in their `pyproject.toml` via `[project.entry-points."claudestruct.plugins"]`. 16 new tests in `tests/test_plugin_sdk.py`.
+  - Pending: published `claudestruct-plugin-sdk` package on PyPI / `claudestruct-plugin-sdk` on npm — both contracts are now in-tree; only the publish remains.
 - [~] **W7.5 — Public playground** (static demo page shipped; live runner deferred behind hosting / rate-limiter / billing decisions)
   - `docs/playground.md` — pre-recorded real `cs review` / `dev` / `plan` / `debug` outputs so visitors can read the verdict shape, diff format, hypothesis ranking, and usage / cache-hit-rate banner before installing. No JS, no hosting cost, deploys via the existing GitHub Pages workflow.
   - "Why no live runner" footer is honest about the cost calculus: every visitor needs an API key or a shared bucket with a rate-limiter / abuse-mitigation queue / billing line. Replaced when W7.5b (hosted bucket) lands.
@@ -623,19 +624,28 @@ local-first GTM thread visible on the roadmap.
     `claw-squad/src/cli.ts`, `claw-squad/docs/voice.md`
   - Scope: M (~200 LOC + mocked tests)
 
-- [ ] **W11.4 — Reviewer-side smart-context** (W10.5b polish)
-  - Coder agent reads the top-K results today; Reviewer doesn't.
-    Apply the same `extraExplicitPaths` mechanism so reviewers
-    see sibling files when verdict requires it.
-  - Files: `claw-squad/src/agents/reviewer.ts`, `orchestrator.ts`
-  - Scope: S (~50 LOC + 1-2 tests)
+- [x] **W11.4 — Reviewer-side smart-context** ✅ (already shipped under W10.5b)
+  - `claw-squad/src/agents/reviewer-context.ts:readReviewerSiblings`
+    + `agents/reviewer.ts:siblingContext` + orchestrator wiring
+    at `orchestrator.ts:1060` give the Reviewer top-K
+    semantically-relevant sibling files alongside the diff,
+    minus paths the diff already covers (avoids duplicate-paste
+    token waste). Failure of the index lookup falls back to
+    "Reviewer sees diff only". 11 cases in
+    `claw-squad/tests/reviewer-context.test.ts`. Listed here
+    for cross-reference; no code change needed in this wave.
 
-- [ ] **W11.5 — Verdict-aware dataset filter** (W10.6 follow-up)
-  - `dataset.ts` currently captures every run regardless of
-    review outcome. Add `--review-decision approve` so fine-tune
-    inputs are scoped to runs that passed review.
-  - Files: `claw-squad/src/runs/dataset.ts`, CLI flag, docs
-  - Scope: S (~50 LOC)
+- [x] **W11.5 — Verdict-aware dataset filter** ✅ (this PR)
+  - `walkRunIo({reasons: Set<string>})` + `claw-squad dataset
+    export --review-decision approve` flag. Filter is per-file
+    (not per-event): the file's `run-end` reason decides
+    whether ANY of its rows are emitted. In-flight runs (no
+    `run-end`, e.g. crashed daemon) are EXCLUDED when the
+    filter is active — better to drop a partial row than to
+    silently learn from incomplete work. 6 new tests in
+    `claw-squad/tests/dataset.test.ts` (happy path, dropped
+    reason, in-flight drop, multi-reason set, no-filter
+    back-compat).
 
 The wave's success criterion: a local-only operator can cycle
 edit → review → ship without ever pinging the cloud, with the

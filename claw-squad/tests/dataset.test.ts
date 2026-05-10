@@ -224,6 +224,97 @@ describe("walkRunIo", () => {
     const out = [...walkRunIo(root)].map((e) => e.prompt);
     expect(out).toEqual(["from-a", "from-b"]);
   });
+
+  // --- W11.5 verdict-aware filter -------------------------------
+
+  it("verdict filter: includes a run that ended with reason=complete", () => {
+    writeRunFile(root, "a.jsonl", [
+      ioEvent({ prompt: "approved-work" }),
+      {
+        type: "run-end",
+        ts: "2026-05-01T10:00:30Z",
+        reason: "complete",
+        overall: { costUsd: 0.5, cacheSavedUsd: 0, calls: 3 },
+      },
+    ]);
+    const out = [
+      ...walkRunIo(root, { reasons: new Set(["complete"]) }),
+    ].map((e) => e.prompt);
+    expect(out).toEqual(["approved-work"]);
+  });
+
+  it("verdict filter: drops a run whose reason doesn't match", () => {
+    writeRunFile(root, "a.jsonl", [
+      ioEvent({ prompt: "rolled-back" }),
+      {
+        type: "run-end",
+        ts: "2026-05-01T10:00:30Z",
+        reason: "max_loops",
+        overall: { costUsd: 0.5, cacheSavedUsd: 0, calls: 3 },
+      },
+    ]);
+    const out = [
+      ...walkRunIo(root, { reasons: new Set(["complete"]) }),
+    ];
+    expect(out).toEqual([]);
+  });
+
+  it("verdict filter: drops in-flight runs (no run-end event)", () => {
+    // A crashed daemon leaves a partial JSONL with no run-end.
+    // Verdict-filtered fine-tunes must NOT learn from partial
+    // work — drop the file entirely.
+    writeRunFile(root, "in-flight.jsonl", [
+      ioEvent({ prompt: "would-be-crashed" }),
+      // No run-end on purpose.
+    ]);
+    const out = [
+      ...walkRunIo(root, { reasons: new Set(["complete"]) }),
+    ];
+    expect(out).toEqual([]);
+  });
+
+  it("verdict filter: includes runs whose reason is in the set", () => {
+    writeRunFile(root, "ok.jsonl", [
+      ioEvent({ prompt: "ok"}),
+      {
+        type: "run-end",
+        ts: "2026-05-01T10:00:30Z",
+        reason: "complete",
+        overall: { costUsd: 0.5, cacheSavedUsd: 0, calls: 1 },
+      },
+    ]);
+    writeRunFile(root, "blocked.jsonl", [
+      ioEvent({ prompt: "blocked" }),
+      {
+        type: "run-end",
+        ts: "2026-05-01T10:01:00Z",
+        reason: "blocked",
+        overall: { costUsd: 0.1, cacheSavedUsd: 0, calls: 1 },
+      },
+    ]);
+    // Operator wants both 'complete' and 'blocked' for a study of
+    // what blocks the orchestrator most.
+    const out = [
+      ...walkRunIo(root, {
+        reasons: new Set(["complete", "blocked"]),
+      }),
+    ].map((e) => e.prompt);
+    expect(out.sort()).toEqual(["blocked", "ok"]);
+  });
+
+  it("no verdict filter: includes runs regardless of run-end reason", () => {
+    writeRunFile(root, "a.jsonl", [
+      ioEvent({ prompt: "kept" }),
+      {
+        type: "run-end",
+        ts: "2026-05-01T10:00:30Z",
+        reason: "aborted",
+        overall: { costUsd: 0, cacheSavedUsd: 0, calls: 0 },
+      },
+    ]);
+    const out = [...walkRunIo(root)].map((e) => e.prompt);
+    expect(out).toEqual(["kept"]);
+  });
 });
 
 describe("toAlpaca / toChat", () => {
