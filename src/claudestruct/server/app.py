@@ -164,6 +164,7 @@ def create_app(
     skip_init: bool = False,
     region: str | None = None,
     cors_origins: list[str] | None = None,
+    rate_limit_per_minute: int | None = None,
 ) -> FastAPI:
     """Build the FastAPI app.
 
@@ -225,6 +226,21 @@ def create_app(
     app.add_middleware(RequestLatencyMiddleware, tracker=app.state.latency_tracker)
     app.add_middleware(RegionHeaderMiddleware, region=app.state.region)
     app.add_middleware(ApiVersionHeaderMiddleware, version=API_VERSION)
+    # In-process rate limiter — opt-in via
+    # CLAUDESTRUCT_RATE_LIMIT_PER_MINUTE or the create_app arg.
+    # Installed only when configured so the default install
+    # carries zero overhead. Operators who rely on the LB for
+    # rate control simply don't set the env var.
+    from claudestruct.server.rate_limit import (
+        RateLimitMiddleware,
+        TokenBucketRateLimiter,
+        resolve_per_minute,
+    )
+    rl_per_minute = resolve_per_minute(rate_limit_per_minute)
+    if rl_per_minute is not None:
+        limiter = TokenBucketRateLimiter(per_minute=rl_per_minute)
+        app.state.rate_limiter = limiter
+        app.add_middleware(RateLimitMiddleware, limiter=limiter)
     # RequestIdMiddleware last so it's the OUTERmost wrapper —
     # every log / audit row downstream (including from the
     # latency tracker that sits inside it) sees the id.
