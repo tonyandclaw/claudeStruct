@@ -32,7 +32,7 @@
     "zod": "^3.25.76"
   },
   "devDependencies": {
-    "@types/node": "^22.10.0",
+    "@types/node": "^25.9.0",
     "@types/picomatch": "^4.0.3",
     "@types/prompts": "^2.4.9",
     "@types/react": "^19.2.14",
