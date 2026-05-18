@@ -15,17 +15,17 @@
     "lint": "tsc --noEmit"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.90.0",
+    "@anthropic-ai/sdk": "^0.96.0",
     "@octokit/rest": "^21.0.0",
-    "@slack/socket-mode": "^2.0.6",
-    "@slack/web-api": "^7.15.1",
+    "@slack/socket-mode": "^2.0.7",
+    "@slack/web-api": "^7.16.0",
     "commander": "^12.1.0",
-    "ink": "^7.0.1",
-    "openai": "^6.34.0",
+    "ink": "^7.0.3",
+    "openai": "^6.38.0",
     "picocolors": "^1.1.1",
     "picomatch": "^4.0.4",
     "prompts": "^2.4.2",
-    "react": "^19.2.5",
+    "react": "^19.2.6",
     "redis": "^5.12.1",
     "simple-git": "^3.27.0",
     "ws": "^8.20.0",
@@ -37,7 +37,7 @@
     "@types/prompts": "^2.4.9",
     "@types/react": "^19.2.14",
     "@types/ws": "^8.18.1",
-    "tsx": "^4.19.2",
+    "tsx": "^4.22.2",
     "typescript": "^5.7.2",
     "vitest": "^2.1.8"
   },
@@ -46,7 +46,7 @@
   "optionalDependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
     "@opentelemetry/api": "^1.9.0",
-    "@opentelemetry/exporter-trace-otlp-http": "^0.55.0",
+    "@opentelemetry/exporter-trace-otlp-http": "^0.218.0",
     "@opentelemetry/sdk-node": "^0.55.0"
   },
   "engines": {
