@@ -113,7 +113,7 @@ jobs:
       # walked one green run end-to-end.
       - name: Scan image with trivy
         continue-on-error: true
-        uses: aquasecurity/trivy-action@0.24.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: ${{ steps.scan_target.outputs.tag }}
           format: sarif
