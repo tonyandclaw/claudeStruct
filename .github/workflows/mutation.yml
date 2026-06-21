@@ -61,7 +61,7 @@ jobs:
 
       - name: Archive mutmut cache + results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: mutmut-${{ github.run_id }}
           # `.mutmut-cache` (sqlite) is what later `mutmut results` /
